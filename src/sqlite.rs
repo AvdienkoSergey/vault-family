@@ -277,3 +277,162 @@ impl<C: CryptoProvider> DB<Authenticated, C> {
         self.crypto.decrypt_entry(entry, &self.session.key)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::types::PlainEntry;
+    use super::*;
+
+    fn open_test_db() -> DB<Open, FakeCrypto> {
+        DB::<Closed, FakeCrypto>::new(FakeCrypto)
+            .open(":memory:")
+            .expect("Failed to open test database")
+    }
+    fn authenticated_test_db() -> DB<Authenticated, FakeCrypto> {
+        let db = open_test_db();
+
+        db.create_user(
+            Email::new("alex@icloud.com".to_string()),
+            MasterPassword::new("SuperSecret123!".to_string()),
+        ).expect("Failed to create user");
+
+        db.authenticate(
+            Email::new("alex@icloud.com".to_string()),
+            MasterPassword::new("SuperSecret123!".to_string()),
+        ).expect("Failed to authenticate")
+    }
+    #[test]
+    fn test_open_database() {
+        let db = open_test_db();
+        let user = db.create_user(
+            Email::new("alex@icloud.com".to_string()),
+            MasterPassword::new("SuperSecret123!".to_string()),
+        ).expect("Failed to create user");
+
+        assert_eq!(user.email.as_str(), "alex@icloud.com");
+    }
+    #[test]
+    fn test_authenticate() {
+        let db = open_test_db();
+
+        // Сначала регистрируем
+        db.create_user(
+            Email::new("alex@icloud.com".to_string()),
+            MasterPassword::new("SuperSecret123!".to_string()),
+        ).expect("Failed to create user");
+
+        // Потом логинимся — db потребляется, возвращается DB<Authenticated>
+        let db = db.authenticate(
+            Email::new("alex@icloud.com".to_string()),
+            MasterPassword::new("SuperSecret123!".to_string()),
+        ).expect("Failed to authenticate");
+
+        // db теперь DB<Authenticated, FakeCrypto>
+        assert_eq!(db.session.user.email.as_str(), "alex@icloud.com");
+    }
+    #[test]
+    fn test_save_and_read_entry() {
+        let db = authenticated_test_db();
+        // Создаём открытую запись
+        let plain = PlainEntry {
+            id: EntryId::new(Uuid::new_v4().to_string()),
+            user_id: UserId::new(db.session.user.id.as_str().to_string()),
+            service_name: ServiceName::new("Hetzner Cloud".to_string()),
+            service_url: ServiceUrl::new("https://console.hetzner.com".to_string()),
+            email: Email::new("alex@icloud.com".to_string()),
+            password: EntryPassword::new("Kx7$mR#2pL9&".to_string()),
+            notes: "VPS CX23 Helsinki".to_string(),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        // Шифруем и сохраняем
+        let encrypted = db.encrypt(&plain);
+        db.save_entry(&encrypted).expect("Failed to save entry");
+        // Читаем обратно
+        let user_id = UserId::new(db.session.user.id.as_str().to_string());
+        let entries = db.list_entries(&user_id).expect("Failed to list entries");
+        assert_eq!(entries.len(), 1);
+        // Расшифровываем и проверяем
+        let decrypted = db.decrypt(&entries[0]);
+        assert_eq!(decrypted.service_name.as_str(), "Hetzner Cloud");
+        assert_eq!(decrypted.service_url.as_str(), "https://console.hetzner.com");
+        assert_eq!(decrypted.email.as_str(), "alex@icloud.com");
+        assert_eq!(decrypted.password.as_str(), "Kx7$mR#2pL9&");
+        assert_eq!(decrypted.notes, "VPS CX23 Helsinki");
+    }
+    #[test]
+    fn test_delete_entry() {
+        let db = authenticated_test_db();
+        let plain = PlainEntry {
+            id: EntryId::new(Uuid::new_v4().to_string()),
+            user_id: UserId::new(db.session.user.id.as_str().to_string()),
+            service_name: ServiceName::new("Instagram".to_string()),
+            service_url: ServiceUrl::new("https://instagram.com".to_string()),
+            email: Email::new("nastya@mail.com".to_string()),
+            password: EntryPassword::new("InstaPass456!".to_string()),
+            notes: "".to_string(),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        let encrypted = db.encrypt(&plain);
+        db.save_entry(&encrypted).expect("Failed to save");
+        let deleted = db.delete_entry(&encrypted.id).expect("Failed to delete");
+        assert!(deleted);
+        let user_id = UserId::new(db.session.user.id.as_str().to_string());
+        let entries = db.list_entries(&user_id).expect("Failed to list");
+        assert_eq!(entries.len(), 0);
+    }
+    #[test]
+    fn test_user_isolation() {
+        let db = open_test_db();
+        // Регистрируем двух юзеров
+        db.create_user(
+            Email::new("alex@icloud.com".to_string()),
+            MasterPassword::new("AlexPass123!".to_string()),
+        ).expect("Failed to create alex");
+        db.create_user(
+            Email::new("nastya@mail.com".to_string()),
+            MasterPassword::new("NastyaPass456!".to_string()),
+        ).expect("Failed to create nastya");
+        // Логинимся как alex
+        let db = db.authenticate(
+            Email::new("alex@icloud.com".to_string()),
+            MasterPassword::new("AlexPass123!".to_string()),
+        ).expect("Failed to auth alex");
+        // Сохраняем запись alex
+        let plain = PlainEntry {
+            id: EntryId::new(Uuid::new_v4().to_string()),
+            user_id: UserId::new(db.session.user.id.as_str().to_string()),
+            service_name: ServiceName::new("Hetzner".to_string()),
+            service_url: ServiceUrl::new("https://hetzner.com".to_string()),
+            email: Email::new("alex@icloud.com".to_string()),
+            password: EntryPassword::new("secret123".to_string()),
+            notes: "".to_string(),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        let encrypted = db.encrypt(&plain);
+        db.save_entry(&encrypted).expect("Failed to save");
+        // Проверяем: у alex одна запись
+        let alex_id = UserId::new(db.session.user.id.as_str().to_string());
+        let alex_entries = db.list_entries(&alex_id).expect("Failed to list");
+        assert_eq!(alex_entries.len(), 1);
+        // Проверяем: у nastya ноль записей (даже через alex's DB)
+        let nastya_fake_id = UserId::new("nastya-fake-id".to_string());
+        let nastya_entries = db.list_entries(&nastya_fake_id).expect("Failed to list");
+        assert_eq!(nastya_entries.len(), 0);
+    }
+    #[test]
+    fn test_wrong_password() {
+        let db = open_test_db();
+        db.create_user(
+            Email::new("alex@icloud.com".to_string()),
+            MasterPassword::new("CorrectPassword!".to_string()),
+        ).expect("Failed to create user");
+        let result = db.authenticate(
+            Email::new("alex@icloud.com".to_string()),
+            MasterPassword::new("WrongPassword!".to_string()),
+        );
+        assert!(result.is_err());
+    }
+}
