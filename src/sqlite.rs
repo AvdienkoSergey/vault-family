@@ -1,12 +1,11 @@
-use crate::crypto_operations::{CryptoProvider, FakeCrypto};
+use crate::crypto_operations::CryptoProvider;
 use crate::types;
 use crate::types::{AuthSalt, EncryptedData, EncryptionSalt, MasterPasswordHash, Nonce};
 use chrono::Utc;
 use rusqlite::Connection;
 use std::marker::PhantomData;
 use types::{
-    AuthSession, Email, EncryptedEntry, EntryId, EntryPassword, MasterPassword, PlainEntry,
-    ServiceName, ServiceUrl, User, UserId,
+    AuthSession, Email, EncryptedEntry, EntryId, MasterPassword, PlainEntry, User, UserId,
 };
 use uuid::Uuid;
 mod sealed {
@@ -42,11 +41,21 @@ pub struct DB<State: ConnectionState, C: CryptoProvider> {
 }
 #[derive(Debug)]
 pub enum VaultError {
-    ConnectionError(String),
-    SchemaError(String),
-    DatabaseError(String),
-    CryptoError(String),
-    AuthError(String),
+    Connection(String),
+    Schema(String),
+    Database(String),
+    Auth(String),
+}
+
+impl std::fmt::Display for VaultError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            VaultError::Connection(msg) => write!(f, "connection error: {msg}"),
+            VaultError::Schema(msg) => write!(f, "schema error: {msg}"),
+            VaultError::Database(msg) => write!(f, "database error: {msg}"),
+            VaultError::Auth(msg) => write!(f, "auth error: {msg}"),
+        }
+    }
 }
 /// Closed: можно только создать и открыть
 impl<C: CryptoProvider> DB<Closed, C> {
@@ -62,7 +71,7 @@ impl<C: CryptoProvider> DB<Closed, C> {
     pub fn open(self, path: &str) -> Result<DB<Open, C>, VaultError> {
         let crypto = self.crypto;
         let conn = Connection::open(path)
-            .map_err(|e| VaultError::ConnectionError(format!("Unable to open database: {}", e)))?;
+            .map_err(|e| VaultError::Connection(format!("Unable to open database: {}", e)))?;
 
         let create_tables = conn.execute_batch(
             "BEGIN;
@@ -86,7 +95,7 @@ impl<C: CryptoProvider> DB<Closed, C> {
         );
 
         if let Err(e) = create_tables {
-            return Err(VaultError::SchemaError(format!(
+            return Err(VaultError::Schema(format!(
                 "Failed to create tables: {}",
                 e
             )));
@@ -138,7 +147,7 @@ impl<C: CryptoProvider> DB<Open, C> {
                     user.created_at.to_string(),
                 ),
             )
-            .map_err(|e| VaultError::DatabaseError(format!("Failed to add User: {}", e)))?;
+            .map_err(|e| VaultError::Database(format!("Failed to add User: {}", e)))?;
 
         Ok(user)
     }
@@ -158,9 +167,7 @@ impl<C: CryptoProvider> DB<Open, C> {
             SELECT id, email, master_hash, auth_salt, encryption_salt, created_at
             FROM users WHERE email = ?1",
                 )
-                .map_err(|e| {
-                    VaultError::DatabaseError(format!("Failed to prepare statement: {}", e))
-                })?;
+                .map_err(|e| VaultError::Database(format!("Failed to prepare statement: {}", e)))?;
             stmt.query_row(rusqlite::params![email.as_str()], |row| {
                 Ok(User {
                     id: UserId::new(row.get(0)?),
@@ -174,12 +181,12 @@ impl<C: CryptoProvider> DB<Open, C> {
                         .unwrap_or_else(|_| Utc::now()),
                 })
             })
-            .map_err(|e| VaultError::DatabaseError(format!("Failed to get user ID: {}", e)))?
+            .map_err(|e| VaultError::Database(format!("Failed to get user ID: {}", e)))?
         };
         let is_verify =
             crypto.verify_master_password(&master_password, &user.master_hash, &user.auth_salt);
         if !is_verify {
-            return Err(VaultError::AuthError("Invalid master password".to_string()));
+            return Err(VaultError::Auth("Invalid master password".to_string()));
         };
         let key = crypto.derive_encryption_key(&master_password, &user.encryption_salt);
         Ok(DB {
@@ -211,7 +218,7 @@ impl<C: CryptoProvider> DB<Authenticated, C> {
                     entry.updated_at.to_rfc3339(),
                 ],
             )
-            .map_err(|e| VaultError::DatabaseError(format!("Failed to save entry: {}", e)))?;
+            .map_err(|e| VaultError::Database(format!("Failed to save entry: {}", e)))?;
 
         Ok(())
     }
@@ -224,9 +231,7 @@ impl<C: CryptoProvider> DB<Authenticated, C> {
             SELECT id, user_id, encrypted_data, nonce, created_at, updated_at
             FROM entries WHERE user_id = ?1",
             )
-            .map_err(|e| {
-                VaultError::DatabaseError(format!("Failed to prepare statement: {}", e))
-            })?;
+            .map_err(|e| VaultError::Database(format!("Failed to prepare statement: {}", e)))?;
         let rows_iter = stmt
             .query_map(rusqlite::params![user_id.as_str()], |row| {
                 Ok(EncryptedEntry {
@@ -244,11 +249,11 @@ impl<C: CryptoProvider> DB<Authenticated, C> {
                         .unwrap_or_else(|_| Utc::now()),
                 })
             })
-            .map_err(|e| VaultError::DatabaseError(format!("Failed to query entries: {}", e)))?;
+            .map_err(|e| VaultError::Database(format!("Failed to query entries: {}", e)))?;
         let mut entries = Vec::new();
         for row in rows_iter {
             let entry =
-                row.map_err(|e| VaultError::DatabaseError(format!("Failed to read entry: {}", e)))?;
+                row.map_err(|e| VaultError::Database(format!("Failed to read entry: {}", e)))?;
             entries.push(entry);
         }
         Ok(entries)
@@ -261,7 +266,7 @@ impl<C: CryptoProvider> DB<Authenticated, C> {
                 "DELETE FROM entries WHERE id = ?1 AND user_id = ?2",
                 rusqlite::params![entry_id.as_str(), self.session.user.id.as_str(),],
             )
-            .map_err(|e| VaultError::DatabaseError(format!("Failed to delete entry: {}", e)))?;
+            .map_err(|e| VaultError::Database(format!("Failed to delete entry: {}", e)))?;
 
         Ok(affected > 0)
     }
@@ -279,10 +284,77 @@ impl<C: CryptoProvider> DB<Authenticated, C> {
     }
 }
 
+pub fn demo() {
+    use crate::crypto_operations::FakeCrypto;
+    use crate::types::{EntryPassword, PlainEntry, ServiceName, ServiceUrl};
+
+    println!("=== Vault Demo (FakeCrypto) ===\n");
+
+    // Closed → Open
+    let db = DB::<Closed, FakeCrypto>::new(FakeCrypto)
+        .open(":memory:")
+        .expect("Failed to open database");
+
+    // Регистрация
+    let user = db
+        .create_user(
+            Email::new("alex@icloud.com".to_string()),
+            MasterPassword::new("SuperSecret123!".to_string()),
+        )
+        .expect("Failed to create user");
+    println!("Registered: {:?}", user.id);
+
+    // Open → Authenticated
+    let db = db
+        .authenticate(
+            Email::new("alex@icloud.com".to_string()),
+            MasterPassword::new("SuperSecret123!".to_string()),
+        )
+        .expect("Failed to authenticate");
+    println!("Authenticated: {:?}", db.session.user.email);
+
+    // Создаём запись → шифруем → сохраняем
+    let plain = PlainEntry {
+        id: EntryId::new(Uuid::new_v4().to_string()),
+        user_id: UserId::new(db.session.user.id.as_str().to_string()),
+        service_name: ServiceName::new("Hetzner Cloud".to_string()),
+        service_url: ServiceUrl::new("https://console.hetzner.com".to_string()),
+        email: Email::new("alex@icloud.com".to_string()),
+        password: EntryPassword::new("Kx7$mR#2pL9&".to_string()),
+        notes: "VPS CX23 Helsinki".to_string(),
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+    };
+
+    let encrypted = db.encrypt(&plain);
+    db.save_entry(&encrypted).expect("Failed to save entry");
+    println!("Saved entry: {:?}", encrypted.id);
+
+    // Читаем → расшифровываем
+    let user_id = UserId::new(db.session.user.id.as_str().to_string());
+    let entries = db.list_entries(&user_id).expect("Failed to list entries");
+    println!("Found {} entry(ies)", entries.len());
+
+    let decrypted = db.decrypt(&entries[0]);
+    println!(
+        "Decrypted: {} — {}",
+        decrypted.service_name.as_str(),
+        decrypted.service_url.as_str()
+    );
+    println!("  email: {:?}", decrypted.email);
+    println!("  password: {:?}", decrypted.password);
+    println!("  notes: {}", decrypted.notes);
+
+    // Удаляем
+    let deleted = db.delete_entry(&encrypted.id).expect("Failed to delete");
+    println!("Deleted: {deleted}");
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::PlainEntry;
+    use crate::crypto_operations::FakeCrypto;
+    use crate::types::{EntryPassword, PlainEntry, ServiceName, ServiceUrl};
 
     fn open_test_db() -> DB<Open, FakeCrypto> {
         DB::<Closed, FakeCrypto>::new(FakeCrypto)

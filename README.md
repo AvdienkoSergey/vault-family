@@ -245,6 +245,39 @@ aes-gcm = "0.10"                                           # AES-256-GCM
 rand = "0.8"                                               # Генерация случайных данных
 ```
 
+## CI / CD
+
+### CI
+
+На каждый PR и push в `main` запускаются 4 параллельных job:
+
+```
+cargo check    — компиляция
+cargo test     — тесты
+cargo clippy   — линтер (с -D warnings)
+cargo fmt      — форматирование
+```
+
+### Релизы (release-please)
+
+Проект использует [release-please](https://github.com/googleapis/release-please) для автоматического семантического версионирования. При push в `main`:
+
+1. Анализируются новые Conventional Commits
+2. Создаётся / обновляется Release PR с CHANGELOG
+3. При мерже PR — создаётся GitHub Release + git tag
+4. Автоматически бампится версия в `Cargo.toml`
+
+### Формат коммитов
+
+```
+feat: описание      → bump patch (до v1.0), bump minor (после v1.0)
+fix: описание       → bump patch
+feat!: описание     → bump minor (до v1.0), bump major (после v1.0)
+docs: описание      → в changelog, без bump
+chore: описание     → без bump
+style: описание     → без bump
+```
+
 ## Roadmap
 
 - [x] Система типов (branded types, typestate)

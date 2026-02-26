@@ -23,31 +23,32 @@ pub trait CryptoProvider {
     fn generate_salt(&self) -> EncryptionSalt;
 }
 
-pub struct RealCrypto; // настоящий PBKDF2 + AES
+#[allow(dead_code)]
+pub struct RealCrypto; // настоящий PBKDF2 + AES, todo: реализовать
 pub struct FakeCrypto; // заглушка для тестов
 
 impl CryptoProvider for RealCrypto {
     /// PlainEntry + EncryptionKey → EncryptedEntry
     /// Единственный способ создать EncryptedEntry
-    fn encrypt_entry(&self, entry: &PlainEntry, key: &EncryptionKey) -> EncryptedEntry {
+    fn encrypt_entry(&self, _entry: &PlainEntry, _key: &EncryptionKey) -> EncryptedEntry {
         todo!()
     }
     /// EncryptedEntry + EncryptionKey → PlainEntry
     /// Единственный способ получить PlainEntry
-    fn decrypt_entry(&self, entry: &EncryptedEntry, key: &EncryptionKey) -> PlainEntry {
+    fn decrypt_entry(&self, _entry: &EncryptedEntry, _key: &EncryptionKey) -> PlainEntry {
         todo!()
     }
     /// Регистрация: хэшируем мастер-пароль для хранения в БД.
     /// Возвращает хеш + соль (оба сохраняются в таблице users)
-    fn hash_master_password(&self, password: &MasterPassword) -> (MasterPasswordHash, AuthSalt) {
+    fn hash_master_password(&self, _password: &MasterPassword) -> (MasterPasswordHash, AuthSalt) {
         todo!()
     }
     /// Логин: проверяем мастер-пароль против хеша из БД
     fn verify_master_password(
         &self,
-        password: &MasterPassword,
-        hash: &MasterPasswordHash,
-        salt: &AuthSalt,
+        _password: &MasterPassword,
+        _hash: &MasterPasswordHash,
+        _salt: &AuthSalt,
     ) -> bool {
         todo!()
     }
@@ -55,8 +56,8 @@ impl CryptoProvider for RealCrypto {
     /// Использует отдельную соль (encryption_salt, не auth_salt)
     fn derive_encryption_key(
         &self,
-        password: &MasterPassword,
-        salt: &EncryptionSalt,
+        _password: &MasterPassword,
+        _salt: &EncryptionSalt,
     ) -> EncryptionKey {
         todo!()
     }
@@ -69,6 +70,7 @@ impl CryptoProvider for RealCrypto {
 
 impl CryptoProvider for FakeCrypto {
     fn encrypt_entry(&self, entry: &PlainEntry, key: &EncryptionKey) -> EncryptedEntry {
+        assert!(!key.as_str().is_empty(), "Encryption key must not be empty");
         let json = serde_json::json!({
             "service_name": entry.service_name.as_str(),
             "service_url": entry.service_url.as_str(),
@@ -88,6 +90,7 @@ impl CryptoProvider for FakeCrypto {
         }
     }
     fn decrypt_entry(&self, entry: &EncryptedEntry, key: &EncryptionKey) -> PlainEntry {
+        assert!(!key.as_str().is_empty(), "Encryption key must not be empty");
         let json: serde_json::Value =
             serde_json::from_str(entry.encrypted_data.as_str()).expect("Invalid JSON");
 
@@ -113,7 +116,7 @@ impl CryptoProvider for FakeCrypto {
         &self,
         password: &MasterPassword,
         hash: &MasterPasswordHash,
-        salt: &AuthSalt,
+        _salt: &AuthSalt,
     ) -> bool {
         let expected: String = password.as_str().chars().rev().collect();
         expected == hash.as_str()

@@ -5,4 +5,5 @@ mod types;
 
 fn main() {
     password_generator::demo();
+    sqlite::demo();
 }
