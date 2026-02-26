@@ -1,31 +1,30 @@
 use crate::types;
-use types::{ PlainEntry, EncryptionKey, EncryptedEntry };
 use crate::types::{
-    MasterPassword,
-    MasterPasswordHash,
-    AuthSalt,
-    EncryptionSalt,
-    EntryId,
-    UserId,
-    EncryptedData,
-    Nonce,
-    ServiceName,
-    ServiceUrl,
-    Email,
-    EntryPassword
+    AuthSalt, Email, EncryptedData, EncryptionSalt, EntryId, EntryPassword, MasterPassword,
+    MasterPasswordHash, Nonce, ServiceName, ServiceUrl, UserId,
 };
+use types::{EncryptedEntry, EncryptionKey, PlainEntry};
 
 pub trait CryptoProvider {
     fn encrypt_entry(&self, entry: &PlainEntry, key: &EncryptionKey) -> EncryptedEntry;
     fn decrypt_entry(&self, entry: &EncryptedEntry, key: &EncryptionKey) -> PlainEntry;
     fn hash_master_password(&self, password: &MasterPassword) -> (MasterPasswordHash, AuthSalt);
-    fn verify_master_password(&self, password: &MasterPassword, hash: &MasterPasswordHash, salt: &AuthSalt) -> bool;
-    fn derive_encryption_key(&self, password: &MasterPassword, salt: &EncryptionSalt) -> EncryptionKey;
+    fn verify_master_password(
+        &self,
+        password: &MasterPassword,
+        hash: &MasterPasswordHash,
+        salt: &AuthSalt,
+    ) -> bool;
+    fn derive_encryption_key(
+        &self,
+        password: &MasterPassword,
+        salt: &EncryptionSalt,
+    ) -> EncryptionKey;
     fn generate_salt(&self) -> EncryptionSalt;
 }
 
-pub struct RealCrypto;       // настоящий PBKDF2 + AES
-pub struct FakeCrypto;       // заглушка для тестов
+pub struct RealCrypto; // настоящий PBKDF2 + AES
+pub struct FakeCrypto; // заглушка для тестов
 
 impl CryptoProvider for RealCrypto {
     /// PlainEntry + EncryptionKey → EncryptedEntry
@@ -44,12 +43,21 @@ impl CryptoProvider for RealCrypto {
         todo!()
     }
     /// Логин: проверяем мастер-пароль против хеша из БД
-    fn verify_master_password(&self, password: &MasterPassword, hash: &MasterPasswordHash, salt: &AuthSalt) -> bool {
+    fn verify_master_password(
+        &self,
+        password: &MasterPassword,
+        hash: &MasterPasswordHash,
+        salt: &AuthSalt,
+    ) -> bool {
         todo!()
     }
     /// После успешного логина: деривируем ключ шифрования.
     /// Использует отдельную соль (encryption_salt, не auth_salt)
-    fn derive_encryption_key(&self, password: &MasterPassword, salt: &EncryptionSalt) -> EncryptionKey {
+    fn derive_encryption_key(
+        &self,
+        password: &MasterPassword,
+        salt: &EncryptionSalt,
+    ) -> EncryptionKey {
         todo!()
     }
     /// Генерация случайной соли (16 байт) для деривации ключа шифрования.
@@ -62,26 +70,26 @@ impl CryptoProvider for RealCrypto {
 impl CryptoProvider for FakeCrypto {
     fn encrypt_entry(&self, entry: &PlainEntry, key: &EncryptionKey) -> EncryptedEntry {
         let json = serde_json::json!({
-        "service_name": entry.service_name.as_str(),
-        "service_url": entry.service_url.as_str(),
-        "email": entry.email.as_str(),
-        "password": entry.password.as_str(),
-        "notes": entry.notes,
-    }).to_string();
+            "service_name": entry.service_name.as_str(),
+            "service_url": entry.service_url.as_str(),
+            "email": entry.email.as_str(),
+            "password": entry.password.as_str(),
+            "notes": entry.notes,
+        })
+        .to_string();
 
         EncryptedEntry {
             id: EntryId::new(entry.id.as_str().to_string()),
             user_id: UserId::new(entry.user_id.as_str().to_string()),
-            encrypted_data: EncryptedData::new(json),  // "шифрование" = просто JSON
+            encrypted_data: EncryptedData::new(json), // "шифрование" = просто JSON
             nonce: Nonce::new("fake_nonce".to_string()),
             created_at: entry.created_at,
             updated_at: entry.updated_at,
         }
     }
     fn decrypt_entry(&self, entry: &EncryptedEntry, key: &EncryptionKey) -> PlainEntry {
-        let json: serde_json::Value = serde_json::from_str(
-            entry.encrypted_data.as_str()
-        ).expect("Invalid JSON");
+        let json: serde_json::Value =
+            serde_json::from_str(entry.encrypted_data.as_str()).expect("Invalid JSON");
 
         PlainEntry {
             id: EntryId::new(entry.id.as_str().to_string()),
@@ -99,10 +107,7 @@ impl CryptoProvider for FakeCrypto {
         // Заглушка: "хеш" = сам пароль задом наперёд
         let fake_hash = password.as_str().chars().rev().collect::<String>();
         let fake_salt = "fake_salt_16bytes".to_string();
-        (
-            MasterPasswordHash::new(fake_hash),
-            AuthSalt::new(fake_salt),
-        )
+        (MasterPasswordHash::new(fake_hash), AuthSalt::new(fake_salt))
     }
     fn verify_master_password(
         &self,

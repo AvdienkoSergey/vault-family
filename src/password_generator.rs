@@ -1,6 +1,6 @@
+use crate::types;
 use rand::Rng;
 use std::marker::PhantomData;
-use crate::types;
 use types::Password;
 
 mod sealed {

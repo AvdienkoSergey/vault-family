@@ -1,23 +1,14 @@
-use std::marker::PhantomData;
-use chrono::Utc;
-use rusqlite::{Connection};
-use uuid::Uuid;
+use crate::crypto_operations::{CryptoProvider, FakeCrypto};
 use crate::types;
-use types::{
-    Email,
-    MasterPassword,
-    User,
-    UserId,
-    AuthSession,
-    EncryptedEntry,
-    EntryId,
-    ServiceName,
-    ServiceUrl,
-    EntryPassword,
-    PlainEntry,
-};
-use crate::crypto_operations::{ CryptoProvider, FakeCrypto };
 use crate::types::{AuthSalt, EncryptedData, EncryptionSalt, MasterPasswordHash, Nonce};
+use chrono::Utc;
+use rusqlite::Connection;
+use std::marker::PhantomData;
+use types::{
+    AuthSession, Email, EncryptedEntry, EntryId, EntryPassword, MasterPassword, PlainEntry,
+    ServiceName, ServiceUrl, User, UserId,
+};
+use uuid::Uuid;
 mod sealed {
     pub trait Sealed {}
 }
@@ -70,9 +61,8 @@ impl<C: CryptoProvider> DB<Closed, C> {
     /// Closed → Open (потребляет self!)
     pub fn open(self, path: &str) -> Result<DB<Open, C>, VaultError> {
         let crypto = self.crypto;
-        let conn = Connection::open(path).map_err(|e| VaultError::ConnectionError(
-            format!("Unable to open database: {}", e)
-        ))?;
+        let conn = Connection::open(path)
+            .map_err(|e| VaultError::ConnectionError(format!("Unable to open database: {}", e)))?;
 
         let create_tables = conn.execute_batch(
             "BEGIN;
@@ -96,9 +86,10 @@ impl<C: CryptoProvider> DB<Closed, C> {
         );
 
         if let Err(e) = create_tables {
-            return Err(VaultError::SchemaError(
-                format!("Failed to create tables: {}", e)
-            ));
+            return Err(VaultError::SchemaError(format!(
+                "Failed to create tables: {}",
+                e
+            )));
         }
 
         Ok(DB {
@@ -112,78 +103,88 @@ impl<C: CryptoProvider> DB<Closed, C> {
 /// Open: регистрация и логин
 impl<C: CryptoProvider> DB<Open, C> {
     /// Создать пользователя (регистрация, не требует логина)
-    pub fn create_user(&self, email: Email, master_password: MasterPassword) -> Result<User, VaultError> {
+    pub fn create_user(
+        &self,
+        email: Email,
+        master_password: MasterPassword,
+    ) -> Result<User, VaultError> {
         let crypto = &self.crypto;
         let id = UserId::new(Uuid::new_v4().to_string());
-        let (
-            master_hash,
-            auth_salt
-        ) = crypto.hash_master_password(
-            &master_password
-        );
+        let (master_hash, auth_salt) = crypto.hash_master_password(&master_password);
         let encryption_salt = crypto.generate_salt();
         let created_at = Utc::now();
 
-        let user: User = User { id, email, master_hash, auth_salt, encryption_salt, created_at };
+        let user: User = User {
+            id,
+            email,
+            master_hash,
+            auth_salt,
+            encryption_salt,
+            created_at,
+        };
 
-        self.conn.execute("
+        self.conn
+            .execute(
+                "
             INSERT INTO users (id, email, master_hash, auth_salt, encryption_salt, created_at)
             VALUES (?1, ?2, ?3, ?4, ?5, ?6);
-        ", (
-            user.id.as_str(),
-            user.email.as_str(),
-            user.master_hash.as_str(),
-            user.auth_salt.as_str(),
-            user.encryption_salt.as_str(),
-            user.created_at.to_string())
-        ).map_err(|e| VaultError::DatabaseError(
-            format!("Failed to add User: {}", e)
-        ))?;
+        ",
+                (
+                    user.id.as_str(),
+                    user.email.as_str(),
+                    user.master_hash.as_str(),
+                    user.auth_salt.as_str(),
+                    user.encryption_salt.as_str(),
+                    user.created_at.to_string(),
+                ),
+            )
+            .map_err(|e| VaultError::DatabaseError(format!("Failed to add User: {}", e)))?;
 
         Ok(user)
     }
 
     /// Open → Authenticated (потребляет self!)
-    pub fn authenticate(self, email: Email, master_password: MasterPassword) -> Result<DB<Authenticated, C>, VaultError> {
+    pub fn authenticate(
+        self,
+        email: Email,
+        master_password: MasterPassword,
+    ) -> Result<DB<Authenticated, C>, VaultError> {
         let conn = self.conn;
         let crypto = self.crypto;
         let user = {
-            let mut stmt = conn.prepare("
+            let mut stmt = conn
+                .prepare(
+                    "
             SELECT id, email, master_hash, auth_salt, encryption_salt, created_at
-            FROM users WHERE email = ?1"
-            ).map_err(|e| VaultError::DatabaseError(
-                format!("Failed to prepare statement: {}", e)
-
-            ))?;
-            stmt.query_row(
-                rusqlite::params![email.as_str()],
-                |row| {
-                    Ok(User {
-                        id: UserId::new(row.get(0)?),
-                        email: Email::new(row.get(1)?),
-                        master_hash: MasterPasswordHash::new(row.get(2)?),
-                        auth_salt: AuthSalt::new(row.get(3)?),
-                        encryption_salt: EncryptionSalt::new(row.get(4)?),
-                        created_at: row.get::<_, String>(5)?
-                            .parse::<chrono::DateTime<Utc>>()
-                            .unwrap_or_else(|_| Utc::now()),
-                    })
-                },
-            ).map_err(|e| VaultError::DatabaseError(
-                format!("Failed to get user ID: {}", e)
-            ))?
+            FROM users WHERE email = ?1",
+                )
+                .map_err(|e| {
+                    VaultError::DatabaseError(format!("Failed to prepare statement: {}", e))
+                })?;
+            stmt.query_row(rusqlite::params![email.as_str()], |row| {
+                Ok(User {
+                    id: UserId::new(row.get(0)?),
+                    email: Email::new(row.get(1)?),
+                    master_hash: MasterPasswordHash::new(row.get(2)?),
+                    auth_salt: AuthSalt::new(row.get(3)?),
+                    encryption_salt: EncryptionSalt::new(row.get(4)?),
+                    created_at: row
+                        .get::<_, String>(5)?
+                        .parse::<chrono::DateTime<Utc>>()
+                        .unwrap_or_else(|_| Utc::now()),
+                })
+            })
+            .map_err(|e| VaultError::DatabaseError(format!("Failed to get user ID: {}", e)))?
         };
-        let is_verify = crypto.verify_master_password(&master_password, &user.master_hash, &user.auth_salt);
+        let is_verify =
+            crypto.verify_master_password(&master_password, &user.master_hash, &user.auth_salt);
         if !is_verify {
             return Err(VaultError::AuthError("Invalid master password".to_string()));
         };
         let key = crypto.derive_encryption_key(&master_password, &user.encryption_salt);
         Ok(DB {
             conn,
-            session: AuthSession {
-                user,
-                key,
-            },
+            session: AuthSession { user, key },
             crypto,
             _state: PhantomData,
         })
@@ -194,73 +195,73 @@ impl<C: CryptoProvider> DB<Authenticated, C> {
     /// Принимает ТОЛЬКО EncryptedEntry
     /// PlainEntry передать невозможно — ошибка компиляции
     pub fn save_entry(&self, entry: &EncryptedEntry) -> Result<(), VaultError> {
-        self.conn.execute("
+        self.conn
+            .execute(
+                "
             INSERT INTO entries (id, user_id, encrypted_data, nonce, created_at, updated_at)
             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
             ON CONFLICT(id) DO UPDATE SET
             encrypted_data = ?3, nonce = ?4, updated_at = ?6",
-            rusqlite::params![
-                entry.id.as_str(),
-                self.session.user.id.as_str(),
-                entry.encrypted_data.as_str(),
-                entry.nonce.as_str(),
-                entry.created_at.to_rfc3339(),
-                entry.updated_at.to_rfc3339(),
-            ],
-        ).map_err(|e| VaultError::DatabaseError(
-            format!("Failed to save entry: {}", e)
-        ))?;
+                rusqlite::params![
+                    entry.id.as_str(),
+                    self.session.user.id.as_str(),
+                    entry.encrypted_data.as_str(),
+                    entry.nonce.as_str(),
+                    entry.created_at.to_rfc3339(),
+                    entry.updated_at.to_rfc3339(),
+                ],
+            )
+            .map_err(|e| VaultError::DatabaseError(format!("Failed to save entry: {}", e)))?;
 
         Ok(())
     }
     /// Возвращает зашифрованные записи
     pub fn list_entries(&self, user_id: &UserId) -> Result<Vec<EncryptedEntry>, VaultError> {
         let conn = &self.conn;
-        let mut stmt = conn.prepare("
+        let mut stmt = conn
+            .prepare(
+                "
             SELECT id, user_id, encrypted_data, nonce, created_at, updated_at
-            FROM entries WHERE user_id = ?1"
-        ).map_err(|e| VaultError::DatabaseError(
-            format!("Failed to prepare statement: {}", e)
-        ))?;
-        let rows_iter = stmt.query_map(
-            rusqlite::params![user_id.as_str()],
-            |row| {
+            FROM entries WHERE user_id = ?1",
+            )
+            .map_err(|e| {
+                VaultError::DatabaseError(format!("Failed to prepare statement: {}", e))
+            })?;
+        let rows_iter = stmt
+            .query_map(rusqlite::params![user_id.as_str()], |row| {
                 Ok(EncryptedEntry {
                     id: EntryId::new(row.get(0)?),
                     user_id: UserId::new(row.get(1)?),
                     encrypted_data: EncryptedData::new(row.get(2)?),
                     nonce: Nonce::new(row.get(3)?),
-                    created_at: row.get::<_, String>(4)?
+                    created_at: row
+                        .get::<_, String>(4)?
                         .parse::<chrono::DateTime<Utc>>()
                         .unwrap_or_else(|_| Utc::now()),
-                    updated_at: row.get::<_, String>(5)?
+                    updated_at: row
+                        .get::<_, String>(5)?
                         .parse::<chrono::DateTime<Utc>>()
                         .unwrap_or_else(|_| Utc::now()),
                 })
-            },
-        ).map_err(|e| VaultError::DatabaseError(
-            format!("Failed to query entries: {}", e)
-        ))?;
+            })
+            .map_err(|e| VaultError::DatabaseError(format!("Failed to query entries: {}", e)))?;
         let mut entries = Vec::new();
         for row in rows_iter {
-            let entry = row.map_err(|e| VaultError::DatabaseError(
-                format!("Failed to read entry: {}", e)
-            ))?;
+            let entry =
+                row.map_err(|e| VaultError::DatabaseError(format!("Failed to read entry: {}", e)))?;
             entries.push(entry);
         }
         Ok(entries)
     }
     /// Удалить запись — нужны оба ID чтобы не удалить чужую
     pub fn delete_entry(&self, entry_id: &EntryId) -> Result<bool, VaultError> {
-        let affected = self.conn.execute(
-            "DELETE FROM entries WHERE id = ?1 AND user_id = ?2",
-            rusqlite::params![
-            entry_id.as_str(),
-            self.session.user.id.as_str(),
-        ],
-        ).map_err(|e| VaultError::DatabaseError(
-            format!("Failed to delete entry: {}", e)
-        ))?;
+        let affected = self
+            .conn
+            .execute(
+                "DELETE FROM entries WHERE id = ?1 AND user_id = ?2",
+                rusqlite::params![entry_id.as_str(), self.session.user.id.as_str(),],
+            )
+            .map_err(|e| VaultError::DatabaseError(format!("Failed to delete entry: {}", e)))?;
 
         Ok(affected > 0)
     }
@@ -280,8 +281,8 @@ impl<C: CryptoProvider> DB<Authenticated, C> {
 
 #[cfg(test)]
 mod tests {
-    use crate::types::PlainEntry;
     use super::*;
+    use crate::types::PlainEntry;
 
     fn open_test_db() -> DB<Open, FakeCrypto> {
         DB::<Closed, FakeCrypto>::new(FakeCrypto)
@@ -294,20 +295,24 @@ mod tests {
         db.create_user(
             Email::new("alex@icloud.com".to_string()),
             MasterPassword::new("SuperSecret123!".to_string()),
-        ).expect("Failed to create user");
+        )
+        .expect("Failed to create user");
 
         db.authenticate(
             Email::new("alex@icloud.com".to_string()),
             MasterPassword::new("SuperSecret123!".to_string()),
-        ).expect("Failed to authenticate")
+        )
+        .expect("Failed to authenticate")
     }
     #[test]
     fn test_open_database() {
         let db = open_test_db();
-        let user = db.create_user(
-            Email::new("alex@icloud.com".to_string()),
-            MasterPassword::new("SuperSecret123!".to_string()),
-        ).expect("Failed to create user");
+        let user = db
+            .create_user(
+                Email::new("alex@icloud.com".to_string()),
+                MasterPassword::new("SuperSecret123!".to_string()),
+            )
+            .expect("Failed to create user");
 
         assert_eq!(user.email.as_str(), "alex@icloud.com");
     }
@@ -319,13 +324,16 @@ mod tests {
         db.create_user(
             Email::new("alex@icloud.com".to_string()),
             MasterPassword::new("SuperSecret123!".to_string()),
-        ).expect("Failed to create user");
+        )
+        .expect("Failed to create user");
 
         // Потом логинимся — db потребляется, возвращается DB<Authenticated>
-        let db = db.authenticate(
-            Email::new("alex@icloud.com".to_string()),
-            MasterPassword::new("SuperSecret123!".to_string()),
-        ).expect("Failed to authenticate");
+        let db = db
+            .authenticate(
+                Email::new("alex@icloud.com".to_string()),
+                MasterPassword::new("SuperSecret123!".to_string()),
+            )
+            .expect("Failed to authenticate");
 
         // db теперь DB<Authenticated, FakeCrypto>
         assert_eq!(db.session.user.email.as_str(), "alex@icloud.com");
@@ -355,7 +363,10 @@ mod tests {
         // Расшифровываем и проверяем
         let decrypted = db.decrypt(&entries[0]);
         assert_eq!(decrypted.service_name.as_str(), "Hetzner Cloud");
-        assert_eq!(decrypted.service_url.as_str(), "https://console.hetzner.com");
+        assert_eq!(
+            decrypted.service_url.as_str(),
+            "https://console.hetzner.com"
+        );
         assert_eq!(decrypted.email.as_str(), "alex@icloud.com");
         assert_eq!(decrypted.password.as_str(), "Kx7$mR#2pL9&");
         assert_eq!(decrypted.notes, "VPS CX23 Helsinki");
@@ -389,16 +400,20 @@ mod tests {
         db.create_user(
             Email::new("alex@icloud.com".to_string()),
             MasterPassword::new("AlexPass123!".to_string()),
-        ).expect("Failed to create alex");
+        )
+        .expect("Failed to create alex");
         db.create_user(
             Email::new("nastya@mail.com".to_string()),
             MasterPassword::new("NastyaPass456!".to_string()),
-        ).expect("Failed to create nastya");
+        )
+        .expect("Failed to create nastya");
         // Логинимся как alex
-        let db = db.authenticate(
-            Email::new("alex@icloud.com".to_string()),
-            MasterPassword::new("AlexPass123!".to_string()),
-        ).expect("Failed to auth alex");
+        let db = db
+            .authenticate(
+                Email::new("alex@icloud.com".to_string()),
+                MasterPassword::new("AlexPass123!".to_string()),
+            )
+            .expect("Failed to auth alex");
         // Сохраняем запись alex
         let plain = PlainEntry {
             id: EntryId::new(Uuid::new_v4().to_string()),
@@ -428,7 +443,8 @@ mod tests {
         db.create_user(
             Email::new("alex@icloud.com".to_string()),
             MasterPassword::new("CorrectPassword!".to_string()),
-        ).expect("Failed to create user");
+        )
+        .expect("Failed to create user");
         let result = db.authenticate(
             Email::new("alex@icloud.com".to_string()),
             MasterPassword::new("WrongPassword!".to_string()),

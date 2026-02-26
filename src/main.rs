@@ -1,7 +1,7 @@
-mod types;
+mod crypto_operations;
 mod password_generator;
 mod sqlite;
-mod crypto_operations;
+mod types;
 
 fn main() {
     password_generator::demo();

@@ -1,5 +1,5 @@
-use std::fmt;
 use chrono::{DateTime, Utc};
+use std::fmt;
 
 // ════════════════════════════════════════════════════════════════════
 // Макросы: фабрики branded types
@@ -26,7 +26,9 @@ macro_rules! branded_no_secret {
 #[macro_export]
 macro_rules! branded_secret {
     ($name:ident) => {
-        #[derive(Hash, PartialEq, Eq, serde::Deserialize, zeroize::Zeroize, zeroize::ZeroizeOnDrop)]
+        #[derive(
+            Hash, PartialEq, Eq, serde::Deserialize, zeroize::Zeroize, zeroize::ZeroizeOnDrop,
+        )]
         pub struct $name(String);
 
         impl $name {
@@ -55,22 +57,22 @@ branded_secret!(Password);
 // Branded types - привязаны к таблицам SQLite (sqlite)
 // ════════════════════════════════════════════════════════════════════
 // --- TABLE users ---
-branded_no_secret!(UserId);                     // users.id
-branded_secret!(Email);                         // users.email (персональные данные)
-branded_secret!(MasterPasswordHash);            // users.master_password_hash
-branded_secret!(AuthSalt);                      // users.auth_salt
-branded_secret!(EncryptionSalt);                // users.encryption_salt
+branded_no_secret!(UserId); // users.id
+branded_secret!(Email); // users.email (персональные данные)
+branded_secret!(MasterPasswordHash); // users.master_password_hash
+branded_secret!(AuthSalt); // users.auth_salt
+branded_secret!(EncryptionSalt); // users.encryption_salt
 // --- TABLE entries ---
-branded_no_secret!(EntryId);                    // entries.id
-branded_no_secret!(EncryptedData);              // entries.encrypted_data (уже зашифровано, не секрет)
-branded_no_secret!(Nonce);                      // entries.nonce (не секрет, бесполезен без ключа)
+branded_no_secret!(EntryId); // entries.id
+branded_no_secret!(EncryptedData); // entries.encrypted_data (уже зашифровано, не секрет)
+branded_no_secret!(Nonce); // entries.nonce (не секрет, бесполезен без ключа)
 // --- Вне БД: живут только в памяти ---
-branded_secret!(MasterPassword);                // ввод пользователя, никогда не хранится
-branded_secret!(EncryptionKey);                 // деривируется из мастер-пароля, никогда не хранится
-branded_secret!(EntryPassword);                 // расшифрованный пароль записи
+branded_secret!(MasterPassword); // ввод пользователя, никогда не хранится
+branded_secret!(EncryptionKey); // деривируется из мастер-пароля, никогда не хранится
+branded_secret!(EntryPassword); // расшифрованный пароль записи
 // --- Для полей расшифрованной записи ---
-branded_no_secret!(ServiceName);                // "Hetzner Cloud"
-branded_no_secret!(ServiceUrl);                 // "https://console.hetzner.com"
+branded_no_secret!(ServiceName); // "Hetzner Cloud"
+branded_no_secret!(ServiceUrl); // "https://console.hetzner.com"
 
 // ════════════════════════════════════════════════════════════════════
 //  Доменные структуры
@@ -108,7 +110,7 @@ pub struct PlainEntry {
 pub struct EncryptedEntry {
     pub id: EntryId,
     pub user_id: UserId,
-    pub encrypted_data: EncryptedData,    // PlainEntry → AES-GCM → base64
+    pub encrypted_data: EncryptedData, // PlainEntry → AES-GCM → base64
     pub nonce: Nonce,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
