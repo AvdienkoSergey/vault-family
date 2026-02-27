@@ -1,4 +1,4 @@
-# 🔐 Vault Family — Type-Safe Password Manager
+# Vault Family — Type-Safe Password Manager
 
 Персональный менеджер паролей с E2E шифрованием, построенный на принципах type-driven development в Rust.
 
@@ -20,56 +20,63 @@
 ```
 vault-family/
 ├── src/
-│   ├── main.rs                 # Точка входа
-│   ├── types.rs                # Макросы branded_id! и branded_secret!
-│   ├── vault_store.rs          # Branded types, структуры, DB операции
-│   ├── crypto_operations.rs    # Хеширование, шифрование, деривация
-│   └── password_generator.rs   # Генератор паролей с typestate
+│   ├── lib.rs                  # Library crate: pub mod для всех модулей
+│   ├── main.rs                 # Binary crate: тонкая обёртка → cli::run()
+│   ├── types.rs                # Макросы branded_no_secret! и branded_secret!
+│   ├── crypto_operations.rs    # CryptoProvider trait, RealCrypto, FakeCrypto
+│   ├── sqlite.rs               # DB typestate (Closed → Open → Authenticated)
+│   ├── password_generator.rs   # Генератор паролей с typestate (Empty → Ready)
+│   └── cli.rs                  # CLI интерфейс (clap)
 ```
+
+Проект разделён на library crate (`lib.rs`) и binary crate (`main.rs`).
+Вся логика живёт в библиотеке — бинарник только вызывает `vault_family::cli::run()`.
+Это позволяет подключить тот же core через HTTP API без дублирования кода.
 
 ### Branded Types
 
 Два макроса создают типы-обёртки вокруг `String`:
 
 ```
-branded_id!       — открытые данные, безопасно логировать
-                    Debug показывает значение
-                    Есть Serialize (можно отправить по API)
+branded_no_secret!  — открытые данные, безопасно логировать
+                      Debug показывает значение
+                      Есть Serialize (можно отправить по API)
 
-branded_secret!   — секретные данные, нельзя светить
-                    Debug показывает (***)
-                    Нет Serialize (нельзя случайно отправить)
-                    Нет Clone (нельзя размножить секрет)
-                    ZeroizeOnDrop (зануляется в RAM при drop)
+branded_secret!     — секретные данные, нельзя светить
+                      Debug показывает (***)
+                      Нет Serialize (нельзя случайно отправить)
+                      Нет Clone (нельзя размножить секрет)
+                      ZeroizeOnDrop (зануляется в RAM при drop)
 ```
 
 ### Все типы системы
 
 ```
 TABLE users (SQLite)
-├── UserId              branded_id      uuid
-├── Email               branded_secret  персональные данные
-├── MasterPasswordHash  branded_secret  PBKDF2 хеш
-├── AuthSalt            branded_secret  соль для аутентификации
-├── EncryptionSalt      branded_secret  соль для ключа шифрования
+├── UserId              branded_no_secret  uuid
+├── Email               branded_secret     персональные данные
+├── MasterPasswordHash  branded_secret     PBKDF2 хеш
+├── AuthSalt            branded_secret     соль для аутентификации
+├── EncryptionSalt      branded_secret     соль для ключа шифрования
 └── created_at          DateTime<Utc>
 
 TABLE entries (SQLite)
-├── EntryId             branded_id      uuid
-├── UserId              branded_id      ссылка на users
-├── EncryptedData       branded_id      зашифрованный blob (уже безопасен)
-├── Nonce               branded_id      nonce для AES-GCM (бесполезен без ключа)
+├── EntryId             branded_no_secret  uuid
+├── UserId              branded_no_secret  ссылка на users
+├── EncryptedData       branded_no_secret  зашифрованный blob (уже безопасен)
+├── Nonce               branded_no_secret  nonce для AES-GCM (бесполезен без ключа)
 ├── created_at          DateTime<Utc>
 └── updated_at          DateTime<Utc>
 
 Только в памяти (никогда не в БД)
-├── MasterPassword      branded_secret  ввод пользователя
-├── EncryptionKey       branded_secret  32 байта, деривируется из MasterPassword
-└── EntryPassword       branded_secret  расшифрованный пароль записи
+├── MasterPassword      branded_secret     ввод пользователя
+├── EncryptionKey       branded_secret     32 байта, деривируется из MasterPassword
+└── EntryPassword       branded_secret     расшифрованный пароль записи
 
 Поля записей
-├── ServiceName         branded_id      "Hetzner Cloud"
-└── ServiceUrl          branded_id      "https://console.hetzner.com"
+├── ServiceName         branded_no_secret  "Hetzner Cloud"
+├── ServiceUrl          branded_no_secret  "https://console.hetzner.com"
+└── Login               branded_secret     логин на сервисе (email, username, телефон)
 ```
 
 ### Доменные структуры
@@ -170,6 +177,36 @@ db.list_entries()
             println!("{:?}", plain.password) → "EntryPassword(***)"
 ```
 
+## CLI
+
+Мастер-пароль всегда вводится интерактивно (скрытый ввод через rpassword), никогда через аргументы командной строки.
+
+```bash
+# Регистрация нового пользователя
+vault-family register --email user@example.com
+
+# Добавить запись (пароль вводится интерактивно, --login по умолчанию = email)
+vault-family add --email user@example.com --service "GitHub" --url "https://github.com" --login "my-gh-user"
+
+# Добавить запись с автогенерацией пароля (24 символа)
+vault-family add --email user@example.com --service "AWS" --url "https://aws.amazon.com" --login "admin" --generate 24
+
+# Список всех записей
+vault-family list --email user@example.com
+
+# Просмотр записи (расшифровка)
+vault-family view --email user@example.com <entry-id>
+
+# Удалить запись
+vault-family delete --email user@example.com <entry-id>
+
+# Сгенерировать пароль (без аутентификации)
+vault-family generate --length 20 --lowercase --uppercase --digits --symbols
+
+# Указать путь к БД (по умолчанию ~/Library/Application Support/vault-family/vault.db)
+vault-family --db /path/to/vault.db list --email user@example.com
+```
+
 ## Typestate: DB
 
 ```
@@ -200,10 +237,29 @@ trait ConnectionState {
 `DB<Closed>` физически не содержит `Connection` — там `()`.
 Никакого `Option`, никакого ослабления типов.
 
+## Typestate: PasswordGenerator
+
+```
+PasswordGenerator<Empty, N>  →  PasswordGenerator<Ready, N>
+       new()                        has_lowercase()
+                                    has_uppercase()
+                                    has_digits()
+                                    has_symbols()
+                                    from_flags(...)
+                                        │
+                                        └── generate() → Password
+```
+
+- `N` — минимальная длина пароля (const generic, проверяется в compile-time)
+- `generate()` доступен только в состоянии `Ready` (хотя бы один charset включён)
+- Builder API: `new().has_lowercase().has_digits().generate()`
+- Runtime API: `from_flags(length, lowercase, uppercase, digits, symbols)` — для CLI
+- Пресет: `secure()` — 20 символов, все наборы
+
 ## Type Safety чек-лист
 
 ```
- ✅  1. Branded newtype обёртки (нельзя передать String)
+ ✅  1. Branded newtype обёртки (branded_no_secret!, branded_secret!)
  ✅  2. Скрытый Debug для секретов
  ✅  3. Нет Display для секретов
  ✅  4. Приватное поле + new() конструктор
@@ -231,18 +287,63 @@ encrypt_entry(&PlainEntry, &EncryptionKey) → EncryptedEntry
 decrypt_entry(&EncryptedEntry, &EncryptionKey) → PlainEntry
 ```
 
+## Тесты
+
+45 unit-тестов покрывают все модули:
+
+```
+cargo test
+
+sqlite::tests                     (6 тестов)  — FakeCrypto
+├── open_database
+├── authenticate
+├── wrong_password
+├── save_and_read_entry
+├── delete_entry
+└── user_isolation
+
+crypto_operations::tests          (15 тестов) — RealCrypto
+├── generate_salt (hex format, uniqueness)
+├── hash_master_password (PHC format, uniqueness)
+├── verify_master_password (correct, wrong)
+├── derive_encryption_key (hex format, deterministic, salt/password isolation)
+└── encrypt/decrypt (roundtrip, different ciphertext, wrong key, invalid key, short key)
+
+password_generator::tests         (24 теста)
+├── new (defaults, custom MIN_LENGTH)
+├── from_flags (valid, all charsets, no charset panic, length below min panic)
+├── length (setter, below min panic)
+├── builder chain (has_*, combinations, length + charset)
+├── generate (correct length, charset compliance, uniqueness, variety)
+└── secure (preset length 20, all charsets)
+```
+
+`CryptoProvider` trait позволяет тестировать DB-логику без реальной криптографии:
+- `FakeCrypto` (`#[cfg(test)]`) — детерминированный, мгновенный
+- `RealCrypto` — PBKDF2 600K итераций, AES-256-GCM (~60с на тест с derive_key)
+
 ## Зависимости
 
 ```toml
-rusqlite = { version = "0.31", features = ["bundled"] }  # SQLite
-uuid = { version = "1.6", features = ["v4"] }            # ID генерация
-chrono = { version = "0.4", features = ["serde"] }       # Даты
-serde = { version = "1.0", features = ["derive"] }       # Сериализация
-serde_json = "1.0"                                        # JSON
-zeroize = { version = "1", features = ["derive"] }        # Зануление RAM
-ring = "0.17"                                              # PBKDF2
-aes-gcm = "0.10"                                           # AES-256-GCM
-rand = "0.8"                                               # Генерация случайных данных
+# Core
+rusqlite = { version = "0.38", features = ["bundled"] }           # SQLite
+uuid = { version = "1.16", features = ["v4"] }                    # ID генерация
+chrono = "0.4"                                                     # Даты
+serde = { version = "1.0", features = ["derive"] }                # Сериализация
+serde_json = "1.0"                                                 # JSON
+zeroize = { version = "1.8", features = ["derive"] }              # Зануление RAM
+
+# Криптография
+pbkdf2 = { version = "0.12", features = ["password-hash", "simple"] }  # PBKDF2
+sha2 = "0.10"                                                           # SHA-256
+aes-gcm = "0.10"                                                        # AES-256-GCM
+hex = "0.4"                                                              # Hex encode/decode
+rand = "0.10"                                                            # Генерация случайных данных
+
+# CLI
+clap = { version = "4.5", features = ["derive"] }                 # Парсинг аргументов
+rpassword = "7.4"                                                  # Скрытый ввод пароля
+dirs = "6.0"                                                       # Кроссплатформенные пути
 ```
 
 ## CI / CD
@@ -283,8 +384,10 @@ style: описание     → без bump
 - [x] Система типов (branded types, typestate)
 - [x] Генератор паролей с typestate
 - [x] DB операции (create_user, authenticate, CRUD entries)
-- [ ] Реализация крипто-операций (PBKDF2, AES-GCM)
-- [ ] CLI интерфейс
+- [x] Реализация крипто-операций (PBKDF2, AES-GCM)
+- [x] CLI интерфейс (clap + rpassword)
+- [x] Library crate (lib.rs) для переиспользования core-логики
+- [x] Unit-тесты (45 тестов: sqlite, crypto_operations, password_generator)
 - [ ] Web API (axum) для доступа с любого устройства
 - [ ] PWA фронтенд с E2E шифрованием в браузере
 - [ ] Деплой на Hetzner CX23 Helsinki
