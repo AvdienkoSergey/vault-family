@@ -142,11 +142,12 @@ fn open_and_authenticate(
     db_path: &str,
     email: String,
 ) -> Result<DB<Authenticated, RealCrypto>, Box<dyn std::error::Error>> {
+    let email = Email::parse(email)?;
     let master = rpassword::prompt_password("Master password: ")?;
 
     let db = DB::<Closed, RealCrypto>::new(RealCrypto).open(db_path)?;
 
-    let db = db.authenticate(Email::new(email), MasterPassword::new(master))?;
+    let db = db.authenticate(email, MasterPassword::new(master))?;
 
     Ok(db)
 }
@@ -156,6 +157,7 @@ fn open_and_authenticate(
 // ════════════════════════════════════════════
 
 fn cmd_register(db_path: &str, email: String) -> Result<(), Box<dyn std::error::Error>> {
+    let email = Email::parse(email)?;
     let master = rpassword::prompt_password("Master password: ")?;
     let confirm = rpassword::prompt_password("Confirm master password: ")?;
 
@@ -165,7 +167,7 @@ fn cmd_register(db_path: &str, email: String) -> Result<(), Box<dyn std::error::
 
     let db = DB::<Closed, RealCrypto>::new(RealCrypto).open(db_path)?;
 
-    let user = db.create_user(Email::new(email), MasterPassword::new(master))?;
+    let user = db.create_user(email, MasterPassword::new(master))?;
 
     println!("User registered successfully.");
     println!("Your user ID: {}", user.id.as_str());

@@ -1,5 +1,6 @@
 use chrono::{DateTime, Utc};
 use std::fmt;
+use std::str::FromStr;
 
 // ════════════════════════════════════════════════════════════════════
 // Макросы: фабрики branded types
@@ -59,6 +60,34 @@ branded_secret!(Password);
 // --- TABLE users ---
 branded_no_secret!(UserId); // users.id
 branded_secret!(Email); // users.email (персональные данные)
+
+// ════════════════════════════════════════════════════════════════════
+// Email валидация (RFC 5321/5322 через email_address crate)
+// ════════════════════════════════════════════════════════════════════
+#[derive(Debug, PartialEq)]
+pub struct EmailError(String);
+
+impl fmt::Display for EmailError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "invalid email: {}", self.0)
+    }
+}
+
+impl std::error::Error for EmailError {}
+
+impl Email {
+    /// Валидирующий конструктор для пользовательского ввода.
+    /// Проверяет формат по RFC 5321/5322
+    pub fn parse(input: String) -> Result<Self, EmailError> {
+        let trimmed = input.trim().to_string();
+        if trimmed.is_empty() {
+            return Err(EmailError("email cannot be empty".to_string()));
+        }
+        email_address::EmailAddress::from_str(&trimmed).map_err(|e| EmailError(e.to_string()))?;
+        Ok(Self::new(trimmed))
+    }
+}
+
 branded_secret!(MasterPasswordHash); // users.master_password_hash
 branded_secret!(AuthSalt); // users.auth_salt
 branded_secret!(EncryptionSalt); // users.encryption_salt
@@ -115,6 +144,43 @@ pub struct EncryptedEntry {
     pub nonce: Nonce,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ════════════════════════════════════════════
+    // Email::parse() — наша логика
+    // RFC-валидацию тестирует email_address crate
+    // ════════════════════════════════════════════
+
+    #[test]
+    fn parse_valid_email() {
+        let email = Email::parse("user@example.com".to_string()).unwrap();
+        assert_eq!(email.as_str(), "user@example.com");
+    }
+
+    #[test]
+    fn parse_trims_whitespace() {
+        let email = Email::parse("  user@example.com  ".to_string()).unwrap();
+        assert_eq!(email.as_str(), "user@example.com");
+    }
+
+    #[test]
+    fn parse_empty_fails() {
+        assert!(Email::parse("".to_string()).is_err());
+    }
+
+    #[test]
+    fn parse_whitespace_only_fails() {
+        assert!(Email::parse("   ".to_string()).is_err());
+    }
+
+    #[test]
+    fn parse_invalid_rejected() {
+        assert!(Email::parse("not-an-email".to_string()).is_err());
+    }
 }
 
 /// Результат аутентификации — User + ключ для шифрования

@@ -49,6 +49,19 @@ branded_secret!     — секретные данные, нельзя свети
                       ZeroizeOnDrop (зануляется в RAM при drop)
 ```
 
+### Email валидация
+
+```
+Email::new(input)    — внутренний конструктор (чтение из БД, тесты)
+                       доверяет входным данным
+
+Email::parse(input)  — валидирующий конструктор (CLI, будущий API)
+                       trim → пустота? → RFC 5321/5322 → Ok(Email)
+                       используется email_address crate
+```
+
+CLI всегда вызывает `Email::parse()` — невалидный email отклоняется до запроса пароля.
+
 ### Все типы системы
 
 ```
@@ -269,6 +282,7 @@ PasswordGenerator<Empty, N>  →  PasswordGenerator<Ready, N>
  ✅  8. Секрет нельзя сериализовать (нет Serialize)
  ✅  9. ZeroizeOnDrop (секреты занулятся в RAM)
  ✅ 10. Typestate для DB (нельзя читать без логина)
+ ✅ 11. Email валидация по RFC 5321/5322 (email_address crate)
 ```
 
 ## Крипто-операции
@@ -289,10 +303,17 @@ decrypt_entry(&EncryptedEntry, &EncryptionKey) → PlainEntry
 
 ## Тесты
 
-45 unit-тестов покрывают все модули:
+50 unit-тестов покрывают все модули:
 
 ```
 cargo test
+
+types::tests                      (5 тестов)  — Email::parse()
+├── parse_valid_email
+├── parse_trims_whitespace
+├── parse_empty_fails
+├── parse_whitespace_only_fails
+└── parse_invalid_rejected
 
 sqlite::tests                     (6 тестов)  — FakeCrypto
 ├── open_database
@@ -339,6 +360,9 @@ sha2 = "0.10"                                                           # SHA-25
 aes-gcm = "0.10"                                                        # AES-256-GCM
 hex = "0.4"                                                              # Hex encode/decode
 rand = "0.10"                                                            # Генерация случайных данных
+
+# Валидация
+email_address = "0.2"                                              # RFC 5321/5322 email валидация
 
 # CLI
 clap = { version = "4.5", features = ["derive"] }                 # Парсинг аргументов
@@ -387,7 +411,8 @@ style: описание     → без bump
 - [x] Реализация крипто-операций (PBKDF2, AES-GCM)
 - [x] CLI интерфейс (clap + rpassword)
 - [x] Library crate (lib.rs) для переиспользования core-логики
-- [x] Unit-тесты (45 тестов: sqlite, crypto_operations, password_generator)
+- [x] Email валидация по RFC 5321/5322 (email_address crate)
+- [x] Unit-тесты (50 тестов: types, sqlite, crypto_operations, password_generator)
 - [ ] Web API (axum) для доступа с любого устройства
 - [ ] PWA фронтенд с E2E шифрованием в браузере
 - [ ] Деплой на Hetzner CX23 Helsinki
