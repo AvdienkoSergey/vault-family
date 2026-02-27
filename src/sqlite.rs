@@ -1,4 +1,4 @@
-use crate::crypto_operations::CryptoProvider;
+use crate::crypto_operations::{CryptoError, CryptoProvider};
 use crate::types;
 use crate::types::{AuthSalt, EncryptedData, EncryptionSalt, MasterPasswordHash, Nonce};
 use chrono::Utc;
@@ -45,8 +45,8 @@ pub enum VaultError {
     Schema(String),
     Database(String),
     Auth(String),
+    Crypto(CryptoError),
 }
-
 impl std::fmt::Display for VaultError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -54,9 +54,16 @@ impl std::fmt::Display for VaultError {
             VaultError::Schema(msg) => write!(f, "schema error: {msg}"),
             VaultError::Database(msg) => write!(f, "database error: {msg}"),
             VaultError::Auth(msg) => write!(f, "auth error: {msg}"),
+            VaultError::Crypto(err) => write!(f, "crypto error: {err}"),
         }
     }
 }
+impl From<CryptoError> for VaultError {
+    fn from(err: CryptoError) -> Self {
+        VaultError::Crypto(err)
+    }
+}
+impl std::error::Error for VaultError {}
 /// Closed: можно только создать и открыть
 impl<C: CryptoProvider> DB<Closed, C> {
     pub fn new(crypto: C) -> Self {
@@ -119,7 +126,7 @@ impl<C: CryptoProvider> DB<Open, C> {
     ) -> Result<User, VaultError> {
         let crypto = &self.crypto;
         let id = UserId::new(Uuid::new_v4().to_string());
-        let (master_hash, auth_salt) = crypto.hash_master_password(&master_password);
+        let (master_hash, auth_salt) = crypto.hash_master_password(&master_password)?;
         let encryption_salt = crypto.generate_salt();
         let created_at = Utc::now();
 
@@ -184,10 +191,10 @@ impl<C: CryptoProvider> DB<Open, C> {
             .map_err(|e| VaultError::Database(format!("Failed to get user ID: {}", e)))?
         };
         let is_verify =
-            crypto.verify_master_password(&master_password, &user.master_hash, &user.auth_salt);
+            crypto.verify_master_password(&master_password, &user.master_hash, &user.auth_salt)?;
         if !is_verify {
             return Err(VaultError::Auth("Invalid master password".to_string()));
-        };
+        }
         let key = crypto.derive_encryption_key(&master_password, &user.encryption_salt);
         Ok(DB {
             conn,
@@ -272,89 +279,35 @@ impl<C: CryptoProvider> DB<Authenticated, C> {
     }
     /// Зашифровать запись для сохранения в БД
     /// Использует EncryptionKey из текущей сессии
-    /// PlainEntry → EncryptedEntry (готова к save_entry
-    pub fn encrypt(&self, entry: &PlainEntry) -> EncryptedEntry {
-        self.crypto.encrypt_entry(entry, &self.session.key)
+    /// PlainEntry → EncryptedEntry (готова к save_entry)
+    pub fn encrypt(&self, entry: &PlainEntry) -> Result<EncryptedEntry, VaultError> {
+        self.crypto
+            .encrypt_entry(entry, &self.session.key)
+            .map_err(VaultError::Crypto)
     }
     /// Расшифровать запись из БД для показа пользователю
     /// Использует EncryptionKey из текущей сессии
     /// EncryptedEntry → PlainEntry (можно читать через .as_str())
-    pub fn decrypt(&self, entry: &EncryptedEntry) -> PlainEntry {
-        self.crypto.decrypt_entry(entry, &self.session.key)
+    pub fn decrypt(&self, entry: &EncryptedEntry) -> Result<PlainEntry, VaultError> {
+        self.crypto
+            .decrypt_entry(entry, &self.session.key)
+            .map_err(VaultError::Crypto)
     }
-}
-
-pub fn demo() {
-    use crate::crypto_operations::FakeCrypto;
-    use crate::types::{EntryPassword, PlainEntry, ServiceName, ServiceUrl};
-
-    println!("=== Vault Demo (FakeCrypto) ===\n");
-
-    // Closed → Open
-    let db = DB::<Closed, FakeCrypto>::new(FakeCrypto)
-        .open(":memory:")
-        .expect("Failed to open database");
-
-    // Регистрация
-    let user = db
-        .create_user(
-            Email::new("alex@icloud.com".to_string()),
-            MasterPassword::new("SuperSecret123!".to_string()),
-        )
-        .expect("Failed to create user");
-    println!("Registered: {:?}", user.id);
-
-    // Open → Authenticated
-    let db = db
-        .authenticate(
-            Email::new("alex@icloud.com".to_string()),
-            MasterPassword::new("SuperSecret123!".to_string()),
-        )
-        .expect("Failed to authenticate");
-    println!("Authenticated: {:?}", db.session.user.email);
-
-    // Создаём запись → шифруем → сохраняем
-    let plain = PlainEntry {
-        id: EntryId::new(Uuid::new_v4().to_string()),
-        user_id: UserId::new(db.session.user.id.as_str().to_string()),
-        service_name: ServiceName::new("Hetzner Cloud".to_string()),
-        service_url: ServiceUrl::new("https://console.hetzner.com".to_string()),
-        email: Email::new("alex@icloud.com".to_string()),
-        password: EntryPassword::new("Kx7$mR#2pL9&".to_string()),
-        notes: "VPS CX23 Helsinki".to_string(),
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
-    };
-
-    let encrypted = db.encrypt(&plain);
-    db.save_entry(&encrypted).expect("Failed to save entry");
-    println!("Saved entry: {:?}", encrypted.id);
-
-    // Читаем → расшифровываем
-    let user_id = UserId::new(db.session.user.id.as_str().to_string());
-    let entries = db.list_entries(&user_id).expect("Failed to list entries");
-    println!("Found {} entry(ies)", entries.len());
-
-    let decrypted = db.decrypt(&entries[0]);
-    println!(
-        "Decrypted: {} — {}",
-        decrypted.service_name.as_str(),
-        decrypted.service_url.as_str()
-    );
-    println!("  email: {:?}", decrypted.email);
-    println!("  password: {:?}", decrypted.password);
-    println!("  notes: {}", decrypted.notes);
-
-    // Удаляем
-    let deleted = db.delete_entry(&encrypted.id).expect("Failed to delete");
-    println!("Deleted: {deleted}");
+    /// Accessor-метод для доступа к приватному полю session.user.id
+    pub fn user_id(&self) -> &UserId {
+        &self.session.user.id
+    }
+    /// Accessor-метод для доступа к приватному полю session.user.email
+    pub fn user_email(&self) -> &Email {
+        &self.session.user.email
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::crypto_operations::FakeCrypto;
-    use crate::types::{EntryPassword, PlainEntry, ServiceName, ServiceUrl};
+    use crate::types::{EntryPassword, Login, PlainEntry, ServiceName, ServiceUrl};
 
     fn open_test_db() -> DB<Open, FakeCrypto> {
         DB::<Closed, FakeCrypto>::new(FakeCrypto)
@@ -419,27 +372,27 @@ mod tests {
             user_id: UserId::new(db.session.user.id.as_str().to_string()),
             service_name: ServiceName::new("Hetzner Cloud".to_string()),
             service_url: ServiceUrl::new("https://console.hetzner.com".to_string()),
-            email: Email::new("alex@icloud.com".to_string()),
+            login: Login::new("alex@icloud.com".to_string()),
             password: EntryPassword::new("Kx7$mR#2pL9&".to_string()),
             notes: "VPS CX23 Helsinki".to_string(),
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
         // Шифруем и сохраняем
-        let encrypted = db.encrypt(&plain);
+        let encrypted = db.encrypt(&plain).expect("Failed to encrypt");
         db.save_entry(&encrypted).expect("Failed to save entry");
         // Читаем обратно
         let user_id = UserId::new(db.session.user.id.as_str().to_string());
         let entries = db.list_entries(&user_id).expect("Failed to list entries");
         assert_eq!(entries.len(), 1);
         // Расшифровываем и проверяем
-        let decrypted = db.decrypt(&entries[0]);
+        let decrypted = db.decrypt(&entries[0]).expect("Failed to decrypt");
         assert_eq!(decrypted.service_name.as_str(), "Hetzner Cloud");
         assert_eq!(
             decrypted.service_url.as_str(),
             "https://console.hetzner.com"
         );
-        assert_eq!(decrypted.email.as_str(), "alex@icloud.com");
+        assert_eq!(decrypted.login.as_str(), "alex@icloud.com");
         assert_eq!(decrypted.password.as_str(), "Kx7$mR#2pL9&");
         assert_eq!(decrypted.notes, "VPS CX23 Helsinki");
     }
@@ -451,13 +404,13 @@ mod tests {
             user_id: UserId::new(db.session.user.id.as_str().to_string()),
             service_name: ServiceName::new("Instagram".to_string()),
             service_url: ServiceUrl::new("https://instagram.com".to_string()),
-            email: Email::new("nastya@mail.com".to_string()),
+            login: Login::new("nastya_gram".to_string()),
             password: EntryPassword::new("InstaPass456!".to_string()),
             notes: "".to_string(),
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
-        let encrypted = db.encrypt(&plain);
+        let encrypted = db.encrypt(&plain).expect("Failed to encrypt");
         db.save_entry(&encrypted).expect("Failed to save");
         let deleted = db.delete_entry(&encrypted.id).expect("Failed to delete");
         assert!(deleted);
@@ -492,13 +445,13 @@ mod tests {
             user_id: UserId::new(db.session.user.id.as_str().to_string()),
             service_name: ServiceName::new("Hetzner".to_string()),
             service_url: ServiceUrl::new("https://hetzner.com".to_string()),
-            email: Email::new("alex@icloud.com".to_string()),
+            login: Login::new("alex_hetzner".to_string()),
             password: EntryPassword::new("secret123".to_string()),
             notes: "".to_string(),
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
-        let encrypted = db.encrypt(&plain);
+        let encrypted = db.encrypt(&plain).expect("Failed to encrypt");
         db.save_entry(&encrypted).expect("Failed to save");
         // Проверяем: у alex одна запись
         let alex_id = UserId::new(db.session.user.id.as_str().to_string());

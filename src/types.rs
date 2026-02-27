@@ -73,6 +73,7 @@ branded_secret!(EntryPassword); // расшифрованный пароль з�
 // --- Для полей расшифрованной записи ---
 branded_no_secret!(ServiceName); // "Hetzner Cloud"
 branded_no_secret!(ServiceUrl); // "https://console.hetzner.com"
+branded_secret!(Login); // логин на сервисе (email, username, телефон и т.д.)
 
 // ════════════════════════════════════════════════════════════════════
 //  Доменные структуры
@@ -97,7 +98,7 @@ pub struct PlainEntry {
     pub user_id: UserId,
     pub service_name: ServiceName,
     pub service_url: ServiceUrl,
-    pub email: Email,
+    pub login: Login,
     pub password: EntryPassword,
     pub notes: String,
     pub created_at: DateTime<Utc>,
