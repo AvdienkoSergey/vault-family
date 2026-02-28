@@ -1,3 +1,5 @@
+use super::AppState;
+use super::extractors::extract_basic_auth;
 use crate::crypto_operations::RealCrypto;
 use crate::password_generator::{Empty, PasswordGenerator};
 use crate::sqlite::{Closed, DB};
@@ -5,63 +7,31 @@ use crate::types::{
     Email, EntryId, EntryPassword, Login, MasterPassword, PlainEntry, ServiceName, ServiceUrl,
     UserId,
 };
+use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
-use axum::routing::{delete, get, post};
-use axum::{Json, Router};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
-use tokio::net::TcpListener;
-use tower_http::trace::TraceLayer;
-use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
-
-// ════════════════════════════════════════════════════════════════════
-// Ошибки сервера
-// ════════════════════════════════════════════════════════════════════
-
-#[derive(Debug)]
-pub enum ServerError {
-    Connection(String),
-}
-
-impl std::error::Error for ServerError {}
-
-impl std::fmt::Display for ServerError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            ServerError::Connection(msg) => write!(f, "connection error: {msg}"),
-        }
-    }
-}
-
-// ════════════════════════════════════════════════════════════════════
-// Shared state
-// ════════════════════════════════════════════════════════════════════
-
-#[derive(Clone)]
-struct AppState {
-    db_path: String,
-}
 
 // ════════════════════════════════════════════════════════════════════
 // Request / Response structs
 // ════════════════════════════════════════════════════════════════════
 
 #[derive(Deserialize)]
-struct RegisterRequest {
+pub struct RegisterRequest {
     email: String,
     master_password: String,
 }
 
 #[derive(Serialize)]
-struct RegisterResponse {
+pub struct RegisterResponse {
     user_id: String,
     message: String,
 }
 
 #[derive(Deserialize)]
-struct AddRequest {
+pub struct AddRequest {
     service_name: String,
     service_url: String,
     login: String,
@@ -70,20 +40,20 @@ struct AddRequest {
 }
 
 #[derive(Serialize)]
-struct AddResponse {
+pub struct AddResponse {
     entry_id: String,
     message: String,
 }
 
 #[derive(Serialize)]
-struct ListEntry {
+pub struct ListEntry {
     entry_id: String,
     service_name: String,
     created_at: String,
 }
 
 #[derive(Serialize)]
-struct ViewResponse {
+pub struct ViewResponse {
     entry_id: String,
     service_name: String,
     service_url: String,
@@ -95,12 +65,12 @@ struct ViewResponse {
 }
 
 #[derive(Serialize)]
-struct DeleteResponse {
+pub struct DeleteResponse {
     message: String,
 }
 
 #[derive(Deserialize)]
-struct GenerateParams {
+pub struct GenerateParams {
     #[serde(default = "default_length")]
     length: usize,
     #[serde(default = "default_true")]
@@ -121,53 +91,20 @@ fn default_true() -> bool {
 }
 
 #[derive(Serialize)]
-struct GenerateResponse {
+pub struct GenerateResponse {
     password: String,
-}
-
-// ════════════════════════════════════════════════════════════════════
-// Basic Auth extractor
-// ════════════════════════════════════════════════════════════════════
-
-struct Credentials {
-    email: String,
-    master_password: String,
-}
-
-fn extract_basic_auth(headers: &axum::http::HeaderMap) -> Result<Credentials, StatusCode> {
-    let header = headers
-        .get(axum::http::header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .ok_or(StatusCode::UNAUTHORIZED)?;
-
-    let encoded = header
-        .strip_prefix("Basic ")
-        .ok_or(StatusCode::UNAUTHORIZED)?;
-
-    let decoded = String::from_utf8(
-        base64::Engine::decode(&base64::engine::general_purpose::STANDARD, encoded)
-            .map_err(|_| StatusCode::UNAUTHORIZED)?,
-    )
-    .map_err(|_| StatusCode::UNAUTHORIZED)?;
-
-    let (email, password) = decoded.split_once(':').ok_or(StatusCode::UNAUTHORIZED)?;
-
-    Ok(Credentials {
-        email: email.to_string(),
-        master_password: password.to_string(),
-    })
 }
 
 // ════════════════════════════════════════════════════════════════════
 // Handlers
 // ════════════════════════════════════════════════════════════════════
 
-async fn health_handler() -> &'static str {
+pub async fn health_handler() -> &'static str {
     "ok"
 }
 
-/// POST /register — регистрация нового пользователя
-async fn register_handler(
+/// POST /register
+pub async fn register_handler(
     State(state): State<AppState>,
     Json(body): Json<RegisterRequest>,
 ) -> Result<Json<RegisterResponse>, StatusCode> {
@@ -193,8 +130,8 @@ async fn register_handler(
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
 }
 
-/// POST /add — добавить запись (Basic Auth)
-async fn add_handler(
+/// POST /add
+pub async fn add_handler(
     State(state): State<AppState>,
     headers: axum::http::HeaderMap,
     Json(body): Json<AddRequest>,
@@ -205,7 +142,6 @@ async fn add_handler(
     tokio::task::spawn_blocking(move || {
         let email = Email::parse(creds.email).map_err(|_| StatusCode::BAD_REQUEST)?;
 
-        // Closed → Open → Authenticated
         let db = DB::<Closed, RealCrypto>::new(RealCrypto)
             .open(&db_path)
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
@@ -214,7 +150,6 @@ async fn add_handler(
             .authenticate(email, MasterPassword::new(creds.master_password))
             .map_err(|_| StatusCode::UNAUTHORIZED)?;
 
-        // Создаём PlainEntry и шифруем
         let now = Utc::now();
         let entry_id = Uuid::new_v4().to_string();
 
@@ -245,8 +180,8 @@ async fn add_handler(
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
 }
 
-/// GET /list — список всех записей (Basic Auth)
-async fn list_handler(
+/// GET /list
+pub async fn list_handler(
     State(state): State<AppState>,
     headers: axum::http::HeaderMap,
 ) -> Result<Json<Vec<ListEntry>>, StatusCode> {
@@ -287,8 +222,8 @@ async fn list_handler(
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
 }
 
-/// GET /view/:id — просмотр одной записи (Basic Auth)
-async fn view_handler(
+/// GET /view/{id}
+pub async fn view_handler(
     State(state): State<AppState>,
     headers: axum::http::HeaderMap,
     Path(entry_id): Path<String>,
@@ -312,7 +247,6 @@ async fn view_handler(
             .list_entries(&user_id)
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-        // Ищем запись по ID
         let entry = entries
             .iter()
             .find(|e| e.id.as_str() == entry_id)
@@ -337,8 +271,8 @@ async fn view_handler(
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
 }
 
-/// DELETE /delete/:id — удалить запись (Basic Auth)
-async fn delete_handler(
+/// DELETE /delete/{id}
+pub async fn delete_handler(
     State(state): State<AppState>,
     headers: axum::http::HeaderMap,
     Path(entry_id): Path<String>,
@@ -373,8 +307,8 @@ async fn delete_handler(
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
 }
 
-/// GET /generate — генерация пароля (без аутентификации)
-async fn generate_handler(
+/// GET /generate
+pub async fn generate_handler(
     Query(params): Query<GenerateParams>,
 ) -> Result<Json<GenerateResponse>, StatusCode> {
     let length = params.length;
@@ -397,42 +331,4 @@ async fn generate_handler(
     Ok(Json(GenerateResponse {
         password: password.as_str().to_string(),
     }))
-}
-
-// ════════════════════════════════════════════════════════════════════
-// Server
-// ════════════════════════════════════════════════════════════════════
-
-pub async fn run_server(host: &str, port: u16, db_path: String) -> Result<(), ServerError> {
-    let socket_address = format!("{}:{}", &host, &port);
-    tracing_subscriber::fmt()
-        .with_target(false)
-        .with_env_filter(
-            EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| EnvFilter::new("tower_http=debug")),
-        )
-        .compact()
-        .init();
-    let app: Router = Router::new()
-        .route("/health", get(health_handler))
-        .route("/register", post(register_handler))
-        .route("/add", post(add_handler))
-        .route("/list", get(list_handler))
-        .route("/view/{id}", get(view_handler))
-        .route("/delete/{id}", delete(delete_handler))
-        .route("/generate", get(generate_handler))
-        .layer(TraceLayer::new_for_http())
-        .with_state(AppState { db_path });
-
-    let listener = TcpListener::bind(socket_address)
-        .await
-        .map_err(|e| ServerError::Connection(format!("Unable to open remote address: {}", e)))?;
-
-    println!("Server started at http://{}:{}", host, port);
-
-    axum::serve(listener, app)
-        .await
-        .map_err(|e| ServerError::Connection(format!("Unable to start server: {}", e)))?;
-
-    Ok(())
 }
