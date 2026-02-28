@@ -1,6 +1,7 @@
 use chrono::{DateTime, Utc};
 use std::fmt;
 use std::str::FromStr;
+use std::string::String;
 
 // ════════════════════════════════════════════════════════════════════
 // Макросы: фабрики branded types
@@ -22,7 +23,6 @@ macro_rules! branded_no_secret {
         }
     };
 }
-
 /// Секретные данные — прячем в Debug, нет Serialize (нельзя случайно отправить)
 #[macro_export]
 macro_rules! branded_secret {
@@ -48,33 +48,27 @@ macro_rules! branded_secret {
         }
     };
 }
-
 // ════════════════════════════════════════════════════════════════════
 // Branded types - привязаны к генератору паролей (password_generator)
 // ════════════════════════════════════════════════════════════════════
 branded_secret!(Password);
-
 // ════════════════════════════════════════════════════════════════════
 // Branded types - привязаны к таблицам SQLite (sqlite)
 // ════════════════════════════════════════════════════════════════════
 // --- TABLE users ---
 branded_no_secret!(UserId); // users.id
 branded_secret!(Email); // users.email (персональные данные)
-
 // ════════════════════════════════════════════════════════════════════
 // Email валидация (RFC 5321/5322 через email_address crate)
 // ════════════════════════════════════════════════════════════════════
 #[derive(Debug, PartialEq)]
 pub struct EmailError(String);
-
 impl fmt::Display for EmailError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "invalid email: {}", self.0)
     }
 }
-
 impl std::error::Error for EmailError {}
-
 impl Email {
     /// Валидирующий конструктор для пользовательского ввода.
     /// Проверяет формат по RFC 5321/5322
@@ -87,65 +81,6 @@ impl Email {
         Ok(Self::new(trimmed))
     }
 }
-
-branded_secret!(MasterPasswordHash); // users.master_password_hash
-branded_secret!(AuthSalt); // users.auth_salt
-branded_secret!(EncryptionSalt); // users.encryption_salt
-// --- TABLE entries ---
-branded_no_secret!(EntryId); // entries.id
-branded_no_secret!(EncryptedData); // entries.encrypted_data (уже зашифровано, не секрет)
-branded_no_secret!(Nonce); // entries.nonce (не секрет, бесполезен без ключа)
-// --- Вне БД: живут только в памяти ---
-branded_secret!(MasterPassword); // ввод пользователя, никогда не хранится
-branded_secret!(EncryptionKey); // деривируется из мастер-пароля, никогда не хранится
-branded_secret!(EntryPassword); // расшифрованный пароль записи
-// --- Для полей расшифрованной записи ---
-branded_no_secret!(ServiceName); // "Hetzner Cloud"
-branded_no_secret!(ServiceUrl); // "https://console.hetzner.com"
-branded_secret!(Login); // логин на сервисе (email, username, телефон и т.д.)
-
-// ════════════════════════════════════════════════════════════════════
-//  Доменные структуры
-//════════════════════════════════════════════════════════════════════
-/// Пользователь — соответствует строке в TABLE users
-/// Возвращается после create_user и authenticate
-#[derive(Debug)]
-pub struct User {
-    pub id: UserId,
-    pub email: Email,
-    pub master_hash: MasterPasswordHash,
-    pub auth_salt: AuthSalt,
-    pub encryption_salt: EncryptionSalt,
-    pub created_at: DateTime<Utc>,
-}
-
-/// Расшифрованная запись — живёт ТОЛЬКО в памяти
-/// В базу данных попасть НЕ МОЖЕТ (нет EncryptedData)
-#[derive(Debug)]
-pub struct PlainEntry {
-    pub id: EntryId,
-    pub user_id: UserId,
-    pub service_name: ServiceName,
-    pub service_url: ServiceUrl,
-    pub login: Login,
-    pub password: EntryPassword,
-    pub notes: String,
-    pub created_at: DateTime<Utc>,
-    pub updated_at: DateTime<Utc>,
-}
-
-/// Зашифрованная запись — соответствует строке в TABLE entries
-/// Только эта структура может быть сохранена в БД
-#[derive(Debug, Clone)]
-pub struct EncryptedEntry {
-    pub id: EntryId,
-    pub user_id: UserId,
-    pub encrypted_data: EncryptedData, // PlainEntry → AES-GCM → base64
-    pub nonce: Nonce,
-    pub created_at: DateTime<Utc>,
-    pub updated_at: DateTime<Utc>,
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -183,6 +118,60 @@ mod tests {
     }
 }
 
+branded_secret!(MasterPasswordHash); // users.master_password_hash
+branded_secret!(AuthSalt); // users.auth_salt
+branded_secret!(EncryptionSalt); // users.encryption_salt
+// --- TABLE entries ---
+branded_no_secret!(EntryId); // entries.id
+branded_no_secret!(EncryptedData); // entries.encrypted_data (уже зашифровано, не секрет)
+branded_no_secret!(Nonce); // entries.nonce (не секрет, бесполезен без ключа)
+// --- Вне БД: живут только в памяти ---
+branded_secret!(MasterPassword); // ввод пользователя, никогда не хранится
+branded_secret!(EncryptionKey); // деривируется из мастер-пароля, никогда не хранится
+branded_secret!(EntryPassword); // расшифрованный пароль записи
+// --- Для полей расшифрованной записи ---
+branded_no_secret!(ServiceName); // "Hetzner Cloud"
+branded_no_secret!(ServiceUrl); // "https://console.hetzner.com"
+branded_secret!(Login); // логин на сервисе (email, username, телефон и т.д.)
+// ════════════════════════════════════════════════════════════════════
+//  Доменные структуры
+//════════════════════════════════════════════════════════════════════
+/// Пользователь — соответствует строке в TABLE users
+/// Возвращается после create_user и authenticate
+#[derive(Debug)]
+pub struct User {
+    pub id: UserId,
+    pub email: Email,
+    pub master_hash: MasterPasswordHash,
+    pub auth_salt: AuthSalt,
+    pub encryption_salt: EncryptionSalt,
+    pub created_at: DateTime<Utc>,
+}
+/// Расшифрованная запись — живёт ТОЛЬКО в памяти
+/// В базу данных попасть НЕ МОЖЕТ (нет EncryptedData)
+#[derive(Debug)]
+pub struct PlainEntry {
+    pub id: EntryId,
+    pub user_id: UserId,
+    pub service_name: ServiceName,
+    pub service_url: ServiceUrl,
+    pub login: Login,
+    pub password: EntryPassword,
+    pub notes: String,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+/// Зашифрованная запись — соответствует строке в TABLE entries
+/// Только эта структура может быть сохранена в БД
+#[derive(Debug, Clone)]
+pub struct EncryptedEntry {
+    pub id: EntryId,
+    pub user_id: UserId,
+    pub encrypted_data: EncryptedData, // PlainEntry → AES-GCM → base64
+    pub nonce: Nonce,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
 /// Результат аутентификации — User + ключ для шифрования
 /// EncryptionKey не хранится в User, потому что он существует
 /// только пока сессия активна
@@ -191,3 +180,11 @@ pub struct AuthSession {
     pub user: User,
     pub key: EncryptionKey,
 }
+// ════════════════════════════════════════════════════════════════════
+// Branded types - привязаны к JWT
+// ════════════════════════════════════════════════════════════════════
+// JWT
+branded_secret!(JwtSecret); // ключ подписи (живёт в AppState)
+// Refresh tokens
+branded_secret!(RefreshToken); // opaque токен, отдаётся клиенту
+branded_secret!(RefreshTokenHash); // SHA-256 хэш, хранится в БД

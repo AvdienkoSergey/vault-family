@@ -24,4 +24,5 @@ axum = "0.8.8"
 tower-http = { version="0.6.8", features = ["cors", "trace"] }
 base64 = "0.22.1"
 tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
+jsonwebtoken = "10.3.0"
 
