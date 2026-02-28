@@ -26,7 +26,11 @@ vault-family/
 │   ├── crypto_operations.rs    # CryptoProvider trait, RealCrypto, FakeCrypto
 │   ├── sqlite.rs               # DB typestate (Closed → Open → Authenticated)
 │   ├── password_generator.rs   # Генератор паролей с typestate (Empty → Ready)
-│   └── cli.rs                  # CLI интерфейс (clap)
+│   ├── cli.rs                  # CLI интерфейс (clap)
+│   └── http_api/               # HTTP API (axum)
+│       ├── mod.rs              #   Router, AppState, run_server
+│       ├── handlers.rs         #   Handler-функции для всех endpoints
+│       └── extractors.rs       #   Basic Auth extractor
 ```
 
 Проект разделён на library crate (`lib.rs`) и binary crate (`main.rs`).
@@ -218,7 +222,61 @@ vault-family generate --length 20 --lowercase --uppercase --digits --symbols
 
 # Указать путь к БД (по умолчанию ~/Library/Application Support/vault-family/vault.db)
 vault-family --db /path/to/vault.db list --email user@example.com
+
+# Запустить HTTP-сервер (по умолчанию 127.0.0.1:3000)
+vault-family serve
+vault-family serve --host 0.0.0.0 --port 8080
 ```
+
+## HTTP API
+
+HTTP API — полное зеркало CLI. Каждый запрос создаёт свой lifecycle `DB<Closed> → DB<Open> → DB<Authenticated> → drop`. Stateless — аутентификация на каждый запрос через Basic Auth.
+
+### Endpoints
+
+```
+GET    /health              — проверка жизни сервера (без аутентификации)
+POST   /register            — регистрация нового пользователя (JSON body)
+POST   /add                 — добавить запись (Basic Auth + JSON body)
+GET    /list                — список всех записей (Basic Auth)
+GET    /view/{id}           — просмотр записи с расшифровкой (Basic Auth)
+DELETE /delete/{id}         — удалить запись (Basic Auth)
+GET    /generate            — генерация пароля (без аутентификации, query params)
+```
+
+### Примеры
+
+```bash
+# Регистрация
+curl -X POST http://127.0.0.1:3000/register \
+  -H "Content-Type: application/json" \
+  -d '{"email": "user@example.com", "master_password": "Secret123!"}'
+
+# Добавить запись
+curl -u "user@example.com:Secret123!" \
+  -X POST http://127.0.0.1:3000/add \
+  -H "Content-Type: application/json" \
+  -d '{"service_name":"GitHub","service_url":"https://github.com","login":"myuser","password":"ghpass123","notes":"work"}'
+
+# Список записей
+curl -u "user@example.com:Secret123!" http://127.0.0.1:3000/list
+
+# Просмотр записи
+curl -u "user@example.com:Secret123!" http://127.0.0.1:3000/view/<entry-id>
+
+# Удалить запись
+curl -u "user@example.com:Secret123!" -X DELETE http://127.0.0.1:3000/delete/<entry-id>
+
+# Генерация пароля (все параметры опциональны)
+curl "http://127.0.0.1:3000/generate?length=32&symbols=false"
+```
+
+### Архитектурные решения
+
+- **Stateless** — email + master_password на каждый запрос (Basic Auth). Нет сессий, нет токенов, нет состояния на сервере
+- **spawn_blocking** — все DB-операции в blocking closure, т.к. `rusqlite::Connection` не реализует `Send`
+- **Typestate сохранён** — каждый запрос проходит полный lifecycle: `DB<Closed> → DB<Open> → DB<Authenticated> → drop`
+- **Tracing** — `tower_http::TraceLayer` логирует метод, путь, статус и latency каждого запроса
 
 ## Typestate: DB
 
@@ -368,6 +426,13 @@ email_address = "0.2"                                              # RFC 5321/53
 clap = { version = "4.5", features = ["derive"] }                 # Парсинг аргументов
 rpassword = "7.4"                                                  # Скрытый ввод пароля
 dirs = "6.0"                                                       # Кроссплатформенные пути
+
+# HTTP API
+tokio = { version = "1.49", features = ["rt-multi-thread", "macros"] }  # Async runtime
+axum = "0.8"                                                             # HTTP фреймворк
+tower-http = { version = "0.6", features = ["cors", "trace"] }          # HTTP middleware
+tracing-subscriber = { features = ["env-filter"] }                       # Логирование
+base64 = "0.22"                                                          # Basic Auth декодирование
 ```
 
 ## CI / CD
@@ -413,7 +478,7 @@ style: описание     → без bump
 - [x] Library crate (lib.rs) для переиспользования core-логики
 - [x] Email валидация по RFC 5321/5322 (email_address crate)
 - [x] Unit-тесты (50 тестов: types, sqlite, crypto_operations, password_generator)
-- [ ] Web API (axum) для доступа с любого устройства
+- [x] HTTP API (axum): 7 endpoints, Basic Auth, spawn_blocking, tracing
 - [ ] PWA фронтенд с E2E шифрованием в браузере
 - [ ] Деплой на Hetzner CX23 Helsinki
 - [ ] Браузерное расширение с автозаполнением

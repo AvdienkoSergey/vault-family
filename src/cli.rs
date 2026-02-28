@@ -92,9 +92,18 @@ enum Command {
         #[arg(long)]
         symbols: bool,
     },
+    /// Start http server
+    Serve {
+        /// Host address
+        #[arg(long, default_value = "127.0.0.1")]
+        host: String,
+        /// Port number
+        #[arg(long, default_value = "3000")]
+        port: u16,
+    },
 }
 
-pub fn run() -> Result<(), Box<dyn std::error::Error>> {
+pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
     let db_path = resolve_db_path(cli.db)?;
 
@@ -118,6 +127,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             digits,
             symbols,
         } => cmd_generate(length, lowercase, uppercase, digits, symbols),
+        Command::Serve { host, port } => Ok(cmd_serve(&host, port, db_path).await?),
     }
 }
 
@@ -303,5 +313,14 @@ fn cmd_generate(
     let password = generator.generate();
     println!("{}", password.as_str());
 
+    Ok(())
+}
+
+async fn cmd_serve(
+    host: &str,
+    port: u16,
+    db_path: String,
+) -> Result<(), Box<dyn std::error::Error>> {
+    crate::http_api::run_server(host, port, db_path).await?;
     Ok(())
 }
