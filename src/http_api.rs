@@ -1,9 +1,12 @@
 use axum::{Router, routing::get};
 use tokio::net::TcpListener;
 
+#[derive(Debug)]
 pub enum ServerError {
     Connection(String),
 }
+
+impl std::error::Error for ServerError {}
 
 impl std::fmt::Display for ServerError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -25,7 +28,7 @@ pub async fn run_server(host: &str, port: u16, _db_path: String) -> Result<(), S
         .await
         .map_err(|e| ServerError::Connection(format!("Unable to open remote address: {}", e)))?;
 
-    println!("Server started at https://{}:{}", host, port);
+    println!("Server started at http://{}:{}", host, port);
 
     axum::serve(listener, app)
         .await
