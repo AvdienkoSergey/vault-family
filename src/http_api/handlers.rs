@@ -1,5 +1,5 @@
 use super::AppState;
-use super::extractors::extract_basic_auth;
+use super::extractors;
 use crate::crypto_operations::RealCrypto;
 use crate::http_api::jwt;
 use crate::http_api::jwt::REFRESH_TOKEN_TTL_DAYS;
@@ -181,19 +181,19 @@ pub async fn add_handler(
     headers: axum::http::HeaderMap,
     Json(body): Json<AddRequest>,
 ) -> Result<Json<AddResponse>, StatusCode> {
-    let creds = extract_basic_auth(&headers)?;
     let db_path = state.db_path.clone();
+    let jwt_secret = state.jwt_secret.clone();
 
     tokio::task::spawn_blocking(move || {
-        let email = Email::parse(creds.email).map_err(|_| StatusCode::BAD_REQUEST)?;
+        let auth = extractors::authenticate(&headers, &jwt_secret, &db_path)?;
 
         let db = DB::<Closed, RealCrypto>::new(RealCrypto)
             .open(&db_path)
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
         let db = db
-            .authenticate(email, creds.master_password)
-            .map_err(|_| StatusCode::UNAUTHORIZED)?;
+            .restore_session(auth.user_id, auth.encryption_key)
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
         let now = Utc::now();
         let entry_id = Uuid::new_v4().to_string();
@@ -230,19 +230,19 @@ pub async fn list_handler(
     State(state): State<AppState>,
     headers: axum::http::HeaderMap,
 ) -> Result<Json<Vec<ListEntry>>, StatusCode> {
-    let creds = extract_basic_auth(&headers)?;
     let db_path = state.db_path.clone();
+    let jwt_secret = state.jwt_secret.clone();
 
     tokio::task::spawn_blocking(move || {
-        let email = Email::parse(creds.email).map_err(|_| StatusCode::BAD_REQUEST)?;
+        let auth = extractors::authenticate(&headers, &jwt_secret, &db_path)?;
 
         let db = DB::<Closed, RealCrypto>::new(RealCrypto)
             .open(&db_path)
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
         let db = db
-            .authenticate(email, creds.master_password)
-            .map_err(|_| StatusCode::UNAUTHORIZED)?;
+            .restore_session(auth.user_id, auth.encryption_key)
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
         let user_id = UserId::new(db.user_id().as_str().to_string());
         let entries = db
@@ -273,19 +273,19 @@ pub async fn view_handler(
     headers: axum::http::HeaderMap,
     Path(entry_id): Path<String>,
 ) -> Result<Json<ViewResponse>, StatusCode> {
-    let creds = extract_basic_auth(&headers)?;
     let db_path = state.db_path.clone();
+    let jwt_secret = state.jwt_secret.clone();
 
     tokio::task::spawn_blocking(move || {
-        let email = Email::parse(creds.email).map_err(|_| StatusCode::BAD_REQUEST)?;
+        let auth = extractors::authenticate(&headers, &jwt_secret, &db_path)?;
 
         let db = DB::<Closed, RealCrypto>::new(RealCrypto)
             .open(&db_path)
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
         let db = db
-            .authenticate(email, creds.master_password)
-            .map_err(|_| StatusCode::UNAUTHORIZED)?;
+            .restore_session(auth.user_id, auth.encryption_key)
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
         let user_id = UserId::new(db.user_id().as_str().to_string());
         let entries = db
@@ -322,19 +322,19 @@ pub async fn delete_handler(
     headers: axum::http::HeaderMap,
     Path(entry_id): Path<String>,
 ) -> Result<Json<DeleteResponse>, StatusCode> {
-    let creds = extract_basic_auth(&headers)?;
     let db_path = state.db_path.clone();
+    let jwt_secret = state.jwt_secret.clone();
 
     tokio::task::spawn_blocking(move || {
-        let email = Email::parse(creds.email).map_err(|_| StatusCode::BAD_REQUEST)?;
+        let auth = extractors::authenticate(&headers, &jwt_secret, &db_path)?;
 
         let db = DB::<Closed, RealCrypto>::new(RealCrypto)
             .open(&db_path)
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
         let db = db
-            .authenticate(email, creds.master_password)
-            .map_err(|_| StatusCode::UNAUTHORIZED)?;
+            .restore_session(auth.user_id, auth.encryption_key)
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
         let deleted = db
             .delete_entry(&EntryId::new(entry_id))
