@@ -1,35 +1,34 @@
 use super::AppState;
 use super::extractors::extract_basic_auth;
 use crate::crypto_operations::RealCrypto;
+use crate::http_api::jwt;
+use crate::http_api::jwt::REFRESH_TOKEN_TTL_DAYS;
 use crate::password_generator::{Empty, PasswordGenerator};
 use crate::sqlite::{Closed, DB};
 use crate::types::{
-    Email, EntryId, EntryPassword, Login, MasterPassword, PlainEntry, ServiceName, ServiceUrl,
-    UserId,
+    Email, EntryId, EntryPassword, Login, MasterPassword, PlainEntry, RefreshTokenHash,
+    ServiceName, ServiceUrl, UserId,
 };
 use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
-
 // ════════════════════════════════════════════════════════════════════
 // Request / Response structs
 // ════════════════════════════════════════════════════════════════════
-
 #[derive(Deserialize)]
 pub struct RegisterRequest {
     email: String,
     master_password: String,
 }
-
 #[derive(Serialize)]
 pub struct RegisterResponse {
     user_id: String,
     message: String,
 }
-
 #[derive(Deserialize)]
 pub struct AddRequest {
     service_name: String,
@@ -38,20 +37,17 @@ pub struct AddRequest {
     password: String,
     notes: String,
 }
-
 #[derive(Serialize)]
 pub struct AddResponse {
     entry_id: String,
     message: String,
 }
-
 #[derive(Serialize)]
 pub struct ListEntry {
     entry_id: String,
     service_name: String,
     created_at: String,
 }
-
 #[derive(Serialize)]
 pub struct ViewResponse {
     entry_id: String,
@@ -63,12 +59,10 @@ pub struct ViewResponse {
     created_at: String,
     updated_at: String,
 }
-
 #[derive(Serialize)]
 pub struct DeleteResponse {
     message: String,
 }
-
 #[derive(Deserialize)]
 pub struct GenerateParams {
     #[serde(default = "default_length")]
@@ -82,25 +76,76 @@ pub struct GenerateParams {
     #[serde(default = "default_true")]
     symbols: bool,
 }
-
 fn default_length() -> usize {
     20
 }
 fn default_true() -> bool {
     true
 }
-
 #[derive(Serialize)]
 pub struct GenerateResponse {
     password: String,
 }
-
+#[derive(Deserialize)]
+pub struct LoginRequest {
+    email: String,
+    master_password: String,
+}
+#[derive(Serialize)]
+pub struct LoginResponse {
+    access_token: String,
+    refresh_token: String,
+}
 // ════════════════════════════════════════════════════════════════════
 // Handlers
 // ════════════════════════════════════════════════════════════════════
-
 pub async fn health_handler() -> &'static str {
     "ok"
+}
+/// POST /login
+pub async fn login_handler(
+    State(state): State<AppState>,
+    Json(body): Json<LoginRequest>,
+) -> Result<Json<LoginResponse>, StatusCode> {
+    let db_path = state.db_path.clone();
+    let jwt_secret = state.jwt_secret.clone();
+
+    tokio::task::spawn_blocking(move || {
+        let email = Email::parse(body.email).map_err(|_| StatusCode::BAD_REQUEST)?;
+
+        let db = DB::<Closed, RealCrypto>::new(RealCrypto)
+            .open(&db_path)
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+        let db = db
+            .authenticate(email, MasterPassword::new(body.master_password))
+            .map_err(|_| StatusCode::UNAUTHORIZED)?;
+
+        // Access token с encryption_key внутри claims
+        let access_token = jwt::create_access_token(
+            db.user_id(),
+            db.user_email(),
+            db.encryption_key(),
+            &jwt_secret,
+        )
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+        // Refresh token: UUID → SHA-256 hash → сохранить в БД
+        let refresh_token = Uuid::new_v4().to_string();
+        let hash = hex::encode(Sha256::digest(refresh_token.as_bytes()));
+        let token_hash = RefreshTokenHash::new(hash);
+        let expires_at = Utc::now() + chrono::Duration::days(REFRESH_TOKEN_TTL_DAYS);
+
+        db.save_refresh_token(&token_hash, expires_at)
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+        Ok(Json(LoginResponse {
+            access_token,
+            refresh_token,
+        }))
+    })
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
 }
 
 /// POST /register

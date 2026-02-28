@@ -4,6 +4,7 @@ use jsonwebtoken::{DecodingKey, EncodingKey, Header, Validation, decode, encode}
 use serde::{Deserialize, Serialize};
 
 const ACCESS_TOKEN_TTL_MINUTES: i64 = 15;
+pub(crate) const REFRESH_TOKEN_TTL_DAYS: i64 = 7;
 #[derive(Debug)]
 pub enum JwtError {
     Create(String),

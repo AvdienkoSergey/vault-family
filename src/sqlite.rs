@@ -5,7 +5,8 @@ use chrono::Utc;
 use rusqlite::Connection;
 use std::marker::PhantomData;
 use types::{
-    AuthSession, Email, EncryptedEntry, EntryId, MasterPassword, PlainEntry, User, UserId,
+    AuthSession, Email, EncryptedEntry, EntryId, MasterPassword, PlainEntry, RefreshTokenHash,
+    User, UserId,
 };
 use uuid::Uuid;
 mod sealed {
@@ -97,6 +98,11 @@ impl<C: CryptoProvider> DB<Closed, C> {
                 nonce           TEXT NOT NULL,
                 created_at      TEXT NOT NULL,
                 updated_at      TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS refresh_tokens (
+                token_hash      TEXT PRIMARY KEY,
+                user_id         TEXT NOT NULL,
+                expires_at      TEXT NOT NULL
             );
             COMMIT;",
         );
@@ -300,6 +306,28 @@ impl<C: CryptoProvider> DB<Authenticated, C> {
     /// Accessor-метод для доступа к приватному полю session.user.email
     pub fn user_email(&self) -> &Email {
         &self.session.user.email
+    }
+    /// Ссылка на encryption key сессии
+    pub fn encryption_key(&self) -> &types::EncryptionKey {
+        &self.session.key
+    }
+    /// Сохранить хеш refresh-токена в БД
+    pub fn save_refresh_token(
+        &self,
+        token_hash: &RefreshTokenHash,
+        expires_at: chrono::DateTime<Utc>,
+    ) -> Result<(), VaultError> {
+        self.conn
+            .execute(
+                "INSERT INTO refresh_tokens (token_hash, user_id, expires_at) VALUES (?1, ?2, ?3)",
+                rusqlite::params![
+                    token_hash.as_str(),
+                    self.session.user.id.as_str(),
+                    expires_at.to_rfc3339(),
+                ],
+            )
+            .map_err(|e| VaultError::Database(format!("Failed to save refresh token: {e}")))?;
+        Ok(())
     }
 }
 
