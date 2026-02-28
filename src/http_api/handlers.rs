@@ -192,7 +192,7 @@ pub async fn add_handler(
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
         let db = db
-            .authenticate(email, MasterPassword::new(creds.master_password))
+            .authenticate(email, creds.master_password)
             .map_err(|_| StatusCode::UNAUTHORIZED)?;
 
         let now = Utc::now();
@@ -241,7 +241,7 @@ pub async fn list_handler(
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
         let db = db
-            .authenticate(email, MasterPassword::new(creds.master_password))
+            .authenticate(email, creds.master_password)
             .map_err(|_| StatusCode::UNAUTHORIZED)?;
 
         let user_id = UserId::new(db.user_id().as_str().to_string());
@@ -284,7 +284,7 @@ pub async fn view_handler(
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
         let db = db
-            .authenticate(email, MasterPassword::new(creds.master_password))
+            .authenticate(email, creds.master_password)
             .map_err(|_| StatusCode::UNAUTHORIZED)?;
 
         let user_id = UserId::new(db.user_id().as_str().to_string());
@@ -333,7 +333,7 @@ pub async fn delete_handler(
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
         let db = db
-            .authenticate(email, MasterPassword::new(creds.master_password))
+            .authenticate(email, creds.master_password)
             .map_err(|_| StatusCode::UNAUTHORIZED)?;
 
         let deleted = db
