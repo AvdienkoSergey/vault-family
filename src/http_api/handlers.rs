@@ -312,7 +312,7 @@ pub async fn generate_handler(
     Query(params): Query<GenerateParams>,
 ) -> Result<Json<GenerateResponse>, StatusCode> {
     let length = params.length;
-    if length < 8 || length > 128 {
+    if !(8..=128).contains(&length) {
         return Err(StatusCode::BAD_REQUEST);
     }
     if !params.lowercase && !params.uppercase && !params.digits && !params.symbols {
