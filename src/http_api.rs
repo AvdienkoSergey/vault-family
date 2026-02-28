@@ -1,7 +1,4 @@
-use axum::{
-    Router,
-    routing::get,
-};
+use axum::{Router, routing::get};
 use tokio::net::TcpListener;
 
 pub enum ServerError {
@@ -22,18 +19,17 @@ async fn health_handler() -> &'static str {
 
 pub async fn run_server(host: &str, port: u16, _db_path: String) -> Result<(), ServerError> {
     let socket_address = format!("{}:{}", &host, &port);
-    let app: Router = Router::new()
-        .route("/health", get(health_handler));
+    let app: Router = Router::new().route("/health", get(health_handler));
 
-    let listener = TcpListener::bind(socket_address).await.map_err(
-        |e| ServerError::Connection(format!("Unable to open remote address: {}", e))
-    )?;
+    let listener = TcpListener::bind(socket_address)
+        .await
+        .map_err(|e| ServerError::Connection(format!("Unable to open remote address: {}", e)))?;
 
-    println!("Server started at http://{}:{}", host, port);
+    println!("Server started at https://{}:{}", host, port);
 
-    axum::serve(listener, app).await.map_err(
-        |e| ServerError::Connection(format!("Unable to start server: {}", e))
-    )?;
+    axum::serve(listener, app)
+        .await
+        .map_err(|e| ServerError::Connection(format!("Unable to start server: {}", e)))?;
 
     Ok(())
 }
