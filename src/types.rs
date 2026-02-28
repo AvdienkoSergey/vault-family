@@ -172,12 +172,20 @@ pub struct EncryptedEntry {
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
-/// Результат аутентификации — User + ключ для шифрования
+/// Минимальные данные пользователя для активной сессии.
+/// Не содержит master_hash, auth_salt, encryption_salt —
+/// они нужны только в момент authenticate().
+#[derive(Debug)]
+pub struct SessionUser {
+    pub id: UserId,
+    pub email: Email,
+}
+/// Результат аутентификации — SessionUser + ключ для шифрования
 /// EncryptionKey не хранится в User, потому что он существует
 /// только пока сессия активна
 #[derive(Debug)]
 pub struct AuthSession {
-    pub user: User,
+    pub user: SessionUser,
     pub key: EncryptionKey,
 }
 // ════════════════════════════════════════════════════════════════════

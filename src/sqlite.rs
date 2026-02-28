@@ -202,10 +202,48 @@ impl<C: CryptoProvider> DB<Open, C> {
             return Err(VaultError::Auth("Invalid master password".to_string()));
         }
         let key = crypto.derive_encryption_key(&master_password, &user.encryption_salt);
+        let session_user = types::SessionUser {
+            id: user.id,
+            email: user.email,
+        };
         Ok(DB {
             conn,
-            session: AuthSession { user, key },
+            session: AuthSession {
+                user: session_user,
+                key,
+            },
             crypto,
+            _state: PhantomData,
+        })
+    }
+    /// Open → Authenticated БЕЗ проверки пароля.
+    /// JWT уже доказал что пользователь аутентифицирован —
+    /// восстанавливаем сессию из проверенных claims.
+    pub fn restore_session(
+        self,
+        user_id: UserId,
+        encryption_key: types::EncryptionKey,
+    ) -> Result<DB<Authenticated, C>, VaultError> {
+        let conn = self.conn;
+        let user = {
+            let mut stmt = conn
+                .prepare("SELECT id, email FROM users WHERE id = ?1")
+                .map_err(|e| VaultError::Database(format!("Failed to prepare statement: {e}")))?;
+            stmt.query_row(rusqlite::params![user_id.as_str()], |row| {
+                Ok(types::SessionUser {
+                    id: UserId::new(row.get(0)?),
+                    email: Email::new(row.get(1)?),
+                })
+            })
+            .map_err(|e| VaultError::Database(format!("User not found: {e}")))?
+        };
+        Ok(DB {
+            conn,
+            session: AuthSession {
+                user,
+                key: encryption_key,
+            },
+            crypto: self.crypto,
             _state: PhantomData,
         })
     }
