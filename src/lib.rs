@@ -3,3 +3,4 @@ pub mod crypto_operations;
 pub mod password_generator;
 pub mod sqlite;
 pub mod types;
+pub mod http_api;
