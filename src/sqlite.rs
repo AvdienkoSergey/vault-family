@@ -247,6 +247,45 @@ impl<C: CryptoProvider> DB<Open, C> {
             _state: PhantomData,
         })
     }
+    /// Проверить refresh-токен и удалить (rotation).
+    /// Возвращает user_id владельца токена.
+    pub fn verify_and_delete_refresh_token(
+        &self,
+        token_hash: &RefreshTokenHash,
+    ) -> Result<UserId, VaultError> {
+        let (user_id, expires_at): (String, String) = self
+            .conn
+            .query_row(
+                "SELECT user_id, expires_at FROM refresh_tokens WHERE token_hash = ?1",
+                rusqlite::params![token_hash.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .map_err(|_| VaultError::Auth("Refresh token not found".to_string()))?;
+
+        let expires =
+            expires_at
+                .parse::<chrono::DateTime<Utc>>()
+                .map_err(|e| VaultError::Database(format!("Invalid expires_at: {e}")))?;
+
+        if expires < Utc::now() {
+            // Удаляем протухший токен
+            let _ = self.conn.execute(
+                "DELETE FROM refresh_tokens WHERE token_hash = ?1",
+                rusqlite::params![token_hash.as_str()],
+            );
+            return Err(VaultError::Auth("Refresh token expired".to_string()));
+        }
+
+        // Rotation: удаляем использованный токен
+        self.conn
+            .execute(
+                "DELETE FROM refresh_tokens WHERE token_hash = ?1",
+                rusqlite::params![token_hash.as_str()],
+            )
+            .map_err(|e| VaultError::Database(format!("Failed to delete refresh token: {e}")))?;
+
+        Ok(UserId::new(user_id))
+    }
 }
 /// Authenticated: работа с записями
 impl<C: CryptoProvider> DB<Authenticated, C> {

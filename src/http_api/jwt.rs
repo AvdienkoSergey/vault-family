@@ -57,3 +57,20 @@ pub fn decode_access_token(token: &str, secret: &JwtSecret) -> Result<Claims, Jw
     let claims = token_data.claims;
     Ok(claims)
 }
+
+/// Декодирует JWT без проверки exp — для /refresh,
+/// где access_token истёк, но подпись должна быть валидной.
+pub fn decode_access_token_allow_expired(
+    token: &str,
+    secret: &JwtSecret,
+) -> Result<Claims, JwtError> {
+    let mut validation = Validation::default();
+    validation.validate_exp = false;
+    let token_data = decode::<Claims>(
+        token,
+        &DecodingKey::from_secret(secret.as_str().as_bytes()),
+        &validation,
+    )
+    .map_err(|e| JwtError::Decode(format!("JWT decode error: {:?}", e)))?;
+    Ok(token_data.claims)
+}

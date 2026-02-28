@@ -96,6 +96,11 @@ pub struct LoginResponse {
     access_token: String,
     refresh_token: String,
 }
+#[derive(Deserialize)]
+pub struct RefreshRequest {
+    refresh_token: String,
+    access_token: String,
+}
 // ════════════════════════════════════════════════════════════════════
 // Handlers
 // ════════════════════════════════════════════════════════════════════
@@ -142,6 +147,68 @@ pub async fn login_handler(
         Ok(Json(LoginResponse {
             access_token,
             refresh_token,
+        }))
+    })
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+}
+
+/// POST /refresh
+pub async fn refresh_handler(
+    State(state): State<AppState>,
+    Json(body): Json<RefreshRequest>,
+) -> Result<Json<LoginResponse>, StatusCode> {
+    let db_path = state.db_path.clone();
+    let jwt_secret = state.jwt_secret.clone();
+
+    tokio::task::spawn_blocking(move || {
+        // 1. Декодируем истёкший access_token (подпись проверяется, exp — нет)
+        let claims = jwt::decode_access_token_allow_expired(&body.access_token, &jwt_secret)
+            .map_err(|_| StatusCode::UNAUTHORIZED)?;
+
+        // 2. Проверяем refresh_token: hash → найти в БД → удалить (rotation)
+        let hash = hex::encode(Sha256::digest(body.refresh_token.as_bytes()));
+        let token_hash = RefreshTokenHash::new(hash);
+
+        let db = DB::<Closed, RealCrypto>::new(RealCrypto)
+            .open(&db_path)
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+        let token_user_id = db
+            .verify_and_delete_refresh_token(&token_hash)
+            .map_err(|_| StatusCode::UNAUTHORIZED)?;
+
+        // 3. Проверяем что user_id в токенах совпадает
+        if token_user_id.as_str() != claims.sub {
+            return Err(StatusCode::UNAUTHORIZED);
+        }
+
+        // 4. Новый access_token (ek берём из старого JWT)
+        let user_id = UserId::new(claims.sub);
+        let email = Email::new(claims.email);
+        let encryption_key = crate::types::EncryptionKey::new(claims.ek);
+
+        let access_token =
+            jwt::create_access_token(&user_id, &email, &encryption_key, &jwt_secret)
+                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+        // 5. Новый refresh_token (rotation)
+        let new_refresh_token = Uuid::new_v4().to_string();
+        let new_hash = hex::encode(Sha256::digest(new_refresh_token.as_bytes()));
+        let new_token_hash = RefreshTokenHash::new(new_hash);
+        let expires_at = Utc::now() + chrono::Duration::days(REFRESH_TOKEN_TTL_DAYS);
+
+        // restore_session чтобы вызвать save_refresh_token на DB<Authenticated>
+        let db = db
+            .restore_session(UserId::new(user_id.as_str().to_string()), encryption_key)
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+        db.save_refresh_token(&new_token_hash, expires_at)
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+        Ok(Json(LoginResponse {
+            access_token,
+            refresh_token: new_refresh_token,
         }))
     })
     .await

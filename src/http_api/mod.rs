@@ -15,7 +15,7 @@ use crate::types::JwtSecret;
 
 use handlers::{
     add_handler, delete_handler, generate_handler, health_handler, list_handler, login_handler,
-    register_handler, view_handler,
+    refresh_handler, register_handler, view_handler,
 };
 
 // ════════════════════════════════════════════════════════════════════
@@ -68,6 +68,7 @@ pub async fn run_server(host: &str, port: u16, db_path: String) -> Result<(), Se
     let app: Router = Router::new()
         .route("/health", get(health_handler))
         .route("/login", post(login_handler))
+        .route("/refresh", post(refresh_handler))
         .route("/register", post(register_handler))
         .route("/add", post(add_handler))
         .route("/list", get(list_handler))
