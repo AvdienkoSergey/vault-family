@@ -188,9 +188,8 @@ pub async fn refresh_handler(
         let email = Email::new(claims.email);
         let encryption_key = crate::types::EncryptionKey::new(claims.ek);
 
-        let access_token =
-            jwt::create_access_token(&user_id, &email, &encryption_key, &jwt_secret)
-                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        let access_token = jwt::create_access_token(&user_id, &email, &encryption_key, &jwt_secret)
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
         // 5. Новый refresh_token (rotation)
         let new_refresh_token = Uuid::new_v4().to_string();

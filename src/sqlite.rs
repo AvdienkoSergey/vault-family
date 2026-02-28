@@ -262,10 +262,9 @@ impl<C: CryptoProvider> DB<Open, C> {
             )
             .map_err(|_| VaultError::Auth("Refresh token not found".to_string()))?;
 
-        let expires =
-            expires_at
-                .parse::<chrono::DateTime<Utc>>()
-                .map_err(|e| VaultError::Database(format!("Invalid expires_at: {e}")))?;
+        let expires = expires_at
+            .parse::<chrono::DateTime<Utc>>()
+            .map_err(|e| VaultError::Database(format!("Invalid expires_at: {e}")))?;
 
         if expires < Utc::now() {
             // Удаляем протухший токен
