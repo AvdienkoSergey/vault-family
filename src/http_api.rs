@@ -5,6 +5,8 @@ use axum::routing::post;
 use axum::{Json, Router, extract::State, http::StatusCode, routing::get};
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
+use tower_http::trace::TraceLayer;
+use tracing_subscriber::EnvFilter;
 
 #[derive(Debug)]
 pub enum ServerError {
@@ -70,9 +72,18 @@ async fn register_handler(
 }
 pub async fn run_server(host: &str, port: u16, db_path: String) -> Result<(), ServerError> {
     let socket_address = format!("{}:{}", &host, &port);
+    tracing_subscriber::fmt()
+        .with_target(false)
+        .with_env_filter(
+            EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| EnvFilter::new("tower_http=debug")),
+        )
+        .compact()
+        .init();
     let app: Router = Router::new()
         .route("/health", get(health_handler))
         .route("/register", post(register_handler))
+        .layer(TraceLayer::new_for_http())
         .with_state(AppState { db_path });
 
     let listener = TcpListener::bind(socket_address)

@@ -23,4 +23,5 @@ tokio = { version = "1.49.0", features = ["rt-multi-thread", "macros"] }
 axum = "0.8.8"
 tower-http = { version="0.6.8", features = ["cors", "trace"] }
 base64 = "0.22.1"
+tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
 
