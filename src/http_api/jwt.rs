@@ -3,10 +3,13 @@ use chrono::Utc;
 use jsonwebtoken::{DecodingKey, EncodingKey, Header, Validation, decode, encode};
 use serde::{Deserialize, Serialize};
 
+const ACCESS_TOKEN_TTL_MINUTES: i64 = 15;
+#[derive(Debug)]
 pub enum JwtError {
     Create(String),
     Decode(String),
 }
+impl std::error::Error for JwtError {}
 impl std::fmt::Display for JwtError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -32,7 +35,8 @@ pub fn create_access_token(
         sub: user_id.as_str().to_string(),
         email: email.as_str().to_string(),
         ek: encryption_key.as_str().to_string(),
-        exp: (Utc::now() + chrono::Duration::hours(24)).timestamp() as usize,
+        exp: (Utc::now() + chrono::Duration::minutes(ACCESS_TOKEN_TTL_MINUTES)).timestamp()
+            as usize,
     };
     let token = encode(
         &Header::default(), // HS256

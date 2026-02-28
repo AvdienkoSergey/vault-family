@@ -1,6 +1,7 @@
 mod extractors;
 mod handlers;
 pub mod jwt;
+pub mod jwt_secret;
 
 use axum::Router;
 use axum::routing::{delete, get, post};
