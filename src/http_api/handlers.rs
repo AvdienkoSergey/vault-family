@@ -116,6 +116,11 @@ pub struct RefreshRequest {
     access_token: String,
 }
 
+#[derive(Serialize)]
+pub struct LogoutResponse {
+    message: String,
+}
+
 // ════════════════════════════════════════════════════════════════════
 // Handlers
 // ════════════════════════════════════════════════════════════════════
@@ -127,7 +132,8 @@ pub async fn health_handler() -> &'static str {
 /// POST /login
 ///
 /// Vault: create_pass(email, password) → VaultPass
-/// Auth:  JWT access_token + refresh_token → auth.db
+/// SessionStore: сохраняем ek в памяти сервера
+/// Auth:  JWT access_token (без ek!) + refresh_token → auth.db
 pub async fn login_handler<C: CryptoProvider + Clone + Send + Sync + 'static>(
     State(state): State<AppState<C>>,
     Json(body): Json<LoginRequest>,
@@ -135,10 +141,18 @@ pub async fn login_handler<C: CryptoProvider + Clone + Send + Sync + 'static>(
     let db_path = state.db_path.clone();
     let auth_db_path = state.auth_db_path.clone();
     let jwt_secret = state.jwt_secret.clone();
+    let session_store = state.session_store.clone();
+    let failed_login_tracker = state.failed_login_tracker.clone();
     let crypto = state.crypto.clone();
 
     tokio::task::spawn_blocking(move || {
+        let email_str = body.email.clone();
         let email = Email::parse(body.email).map_err(|_| StatusCode::BAD_REQUEST)?;
+
+        // 0. Brute-force: проверяем блокировку ДО проверки пароля
+        if failed_login_tracker.is_locked(&email_str) {
+            return Err(StatusCode::FORBIDDEN);
+        }
 
         // 1. Vault: проверяем пароль → VaultPass
         let db = DB::<Closed, C>::new(crypto)
@@ -147,13 +161,23 @@ pub async fn login_handler<C: CryptoProvider + Clone + Send + Sync + 'static>(
 
         let pass = db
             .create_pass(email, MasterPassword::new(body.master_password))
-            .map_err(|_| StatusCode::UNAUTHORIZED)?;
+            .map_err(|_| {
+                // Фиксируем неудачную попытку
+                failed_login_tracker.record_failed_attempt(&email_str);
+                StatusCode::UNAUTHORIZED
+            })?;
 
-        // 2. JWT: access token из VaultPass
+        // 2. SessionStore: сохраняем ek в памяти сервера
+        session_store.insert(
+            pass.user_id().as_str(),
+            &EncryptionKey::new(pass.encryption_key().as_str().to_string()),
+        );
+
+        // 3. JWT: access token из VaultPass (без ek в payload!)
         let access_token = jwt_provider::create_access_token_from_pass(&pass, &jwt_secret)
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-        // 3. Auth store: refresh token → auth.db
+        // 4. Auth store: refresh token → auth.db
         let refresh_token = Uuid::new_v4().to_string();
         let hash = hex::encode(Sha256::digest(refresh_token.as_bytes()));
         let token_hash = RefreshTokenHash::new(hash);
@@ -176,7 +200,7 @@ pub async fn login_handler<C: CryptoProvider + Clone + Send + Sync + 'static>(
 
 /// POST /refresh
 ///
-/// Только auth: JWT decode + auth.db (без vault.db).
+/// Только auth: JWT decode + SessionStore + auth.db (без vault.db).
 /// Refresh-токен не требует открытия Хранилища.
 pub async fn refresh_handler<C: CryptoProvider + Clone + Send + Sync + 'static>(
     State(state): State<AppState<C>>,
@@ -184,6 +208,7 @@ pub async fn refresh_handler<C: CryptoProvider + Clone + Send + Sync + 'static>(
 ) -> Result<Json<LoginResponse>, StatusCode> {
     let auth_db_path = state.auth_db_path.clone();
     let jwt_secret = state.jwt_secret.clone();
+    let session_store = state.session_store.clone();
 
     tokio::task::spawn_blocking(move || {
         // 1. Декодируем истёкший access_token (подпись ✓, exp — ✗)
@@ -207,16 +232,23 @@ pub async fn refresh_handler<C: CryptoProvider + Clone + Send + Sync + 'static>(
             return Err(StatusCode::UNAUTHORIZED);
         }
 
-        // 4. Новый access_token (данные из старого JWT claims)
+        // 4. Достаём ek из SessionStore (не из JWT!)
+        let ek = session_store
+            .get(&claims.sub)
+            .ok_or(StatusCode::UNAUTHORIZED)?;
+
+        // 5. Обновляем TTL записи в SessionStore
+        session_store.insert(&claims.sub, &ek);
+
+        // 6. Новый access_token (без ek в payload)
         let access_token = jwt_provider::create_access_token(
             &token_user_id,
             &Email::new(claims.email),
-            &EncryptionKey::new(claims.ek),
             &jwt_secret,
         )
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-        // 5. Новый refresh_token (rotation)
+        // 7. Новый refresh_token (rotation)
         let new_refresh_token = Uuid::new_v4().to_string();
         let new_hash = hex::encode(Sha256::digest(new_refresh_token.as_bytes()));
         let new_token_hash = RefreshTokenHash::new(new_hash);
@@ -229,6 +261,42 @@ pub async fn refresh_handler<C: CryptoProvider + Clone + Send + Sync + 'static>(
         Ok(Json(LoginResponse {
             access_token,
             refresh_token: new_refresh_token,
+        }))
+    })
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+}
+
+/// POST /logout
+///
+/// Мгновенная revocation: убиваем сессию в SessionStore + все refresh-токены.
+/// После logout:
+/// - Все Bearer JWT → 401 SessionExpired (мгновенно, не через 15 мин)
+/// - Все refresh_token → 401 TokenNotFound (нечем обновить)
+pub async fn logout_handler<C: CryptoProvider + Clone + Send + Sync + 'static>(
+    State(state): State<AppState<C>>,
+    headers: axum::http::HeaderMap,
+) -> Result<Json<LogoutResponse>, StatusCode> {
+    let auth_db_path = state.auth_db_path.clone();
+    let jwt_secret = state.jwt_secret.clone();
+    let session_store = state.session_store.clone();
+
+    tokio::task::spawn_blocking(move || {
+        // Вахтер: JWT-only
+        let pass = auth::guard(&headers, &jwt_secret, &session_store).map_err(StatusCode::from)?;
+
+        // 1. SessionStore: убиваем сессию → все JWT мгновенно невалидны
+        session_store.remove(pass.user_id().as_str());
+
+        // 2. AuthStore: удаляем все refresh-токены → нечем обновить access_token
+        let store =
+            AuthStore::open(&auth_db_path).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        store
+            .delete_all_user_tokens(pass.user_id().as_str())
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+        Ok(Json(LogoutResponse {
+            message: "logged out".to_string(),
         }))
     })
     .await
@@ -273,22 +341,12 @@ pub async fn add_handler<C: CryptoProvider + Clone + Send + Sync + 'static>(
 ) -> Result<Json<AddResponse>, StatusCode> {
     let db_path = state.db_path.clone();
     let jwt_secret = state.jwt_secret.clone();
+    let session_store = state.session_store.clone();
     let crypto = state.crypto.clone();
 
     tokio::task::spawn_blocking(move || {
-        // Вахтер: Bearer JWT (быстрый путь) или Basic Auth (fallback)
-        let crypto_for_verify = crypto.clone();
-        let db_path_for_verify = db_path.clone();
-        let pass = auth::guard(&headers, &jwt_secret, move |email_str, password| {
-            let email = Email::parse(email_str)
-                .map_err(|e| auth::AuthError::InvalidCredentials(format!("invalid email: {e}")))?;
-            let db = DB::<Closed, C>::new(crypto_for_verify)
-                .open(&db_path_for_verify)
-                .map_err(|e| auth::AuthError::InvalidCredentials(format!("db error: {e}")))?;
-            db.create_pass(email, password)
-                .map_err(|e| auth::AuthError::InvalidCredentials(e.to_string()))
-        })
-        .map_err(StatusCode::from)?;
+        // Вахтер: JWT-only
+        let pass = auth::guard(&headers, &jwt_secret, &session_store).map_err(StatusCode::from)?;
 
         // Хранилище: входим с пропуском
         let db = DB::<Closed, C>::new(crypto)
@@ -338,22 +396,12 @@ pub async fn list_handler<C: CryptoProvider + Clone + Send + Sync + 'static>(
 ) -> Result<Json<Vec<ListEntry>>, StatusCode> {
     let db_path = state.db_path.clone();
     let jwt_secret = state.jwt_secret.clone();
+    let session_store = state.session_store.clone();
     let crypto = state.crypto.clone();
 
     tokio::task::spawn_blocking(move || {
-        // Вахтер
-        let crypto_for_verify = crypto.clone();
-        let db_path_for_verify = db_path.clone();
-        let pass = auth::guard(&headers, &jwt_secret, move |email_str, password| {
-            let email = Email::parse(email_str)
-                .map_err(|e| auth::AuthError::InvalidCredentials(format!("invalid email: {e}")))?;
-            let db = DB::<Closed, C>::new(crypto_for_verify)
-                .open(&db_path_for_verify)
-                .map_err(|e| auth::AuthError::InvalidCredentials(format!("db error: {e}")))?;
-            db.create_pass(email, password)
-                .map_err(|e| auth::AuthError::InvalidCredentials(e.to_string()))
-        })
-        .map_err(StatusCode::from)?;
+        // Вахтер: JWT-only
+        let pass = auth::guard(&headers, &jwt_secret, &session_store).map_err(StatusCode::from)?;
 
         // Хранилище
         let db = DB::<Closed, C>::new(crypto)
@@ -396,22 +444,12 @@ pub async fn view_handler<C: CryptoProvider + Clone + Send + Sync + 'static>(
 ) -> Result<Json<ViewResponse>, StatusCode> {
     let db_path = state.db_path.clone();
     let jwt_secret = state.jwt_secret.clone();
+    let session_store = state.session_store.clone();
     let crypto = state.crypto.clone();
 
     tokio::task::spawn_blocking(move || {
-        // Вахтер
-        let crypto_for_verify = crypto.clone();
-        let db_path_for_verify = db_path.clone();
-        let pass = auth::guard(&headers, &jwt_secret, move |email_str, password| {
-            let email = Email::parse(email_str)
-                .map_err(|e| auth::AuthError::InvalidCredentials(format!("invalid email: {e}")))?;
-            let db = DB::<Closed, C>::new(crypto_for_verify)
-                .open(&db_path_for_verify)
-                .map_err(|e| auth::AuthError::InvalidCredentials(format!("db error: {e}")))?;
-            db.create_pass(email, password)
-                .map_err(|e| auth::AuthError::InvalidCredentials(e.to_string()))
-        })
-        .map_err(StatusCode::from)?;
+        // Вахтер: JWT-only
+        let pass = auth::guard(&headers, &jwt_secret, &session_store).map_err(StatusCode::from)?;
 
         // Хранилище
         let db = DB::<Closed, C>::new(crypto)
@@ -460,22 +498,12 @@ pub async fn delete_handler<C: CryptoProvider + Clone + Send + Sync + 'static>(
 ) -> Result<Json<DeleteResponse>, StatusCode> {
     let db_path = state.db_path.clone();
     let jwt_secret = state.jwt_secret.clone();
+    let session_store = state.session_store.clone();
     let crypto = state.crypto.clone();
 
     tokio::task::spawn_blocking(move || {
-        // Вахтер
-        let crypto_for_verify = crypto.clone();
-        let db_path_for_verify = db_path.clone();
-        let pass = auth::guard(&headers, &jwt_secret, move |email_str, password| {
-            let email = Email::parse(email_str)
-                .map_err(|e| auth::AuthError::InvalidCredentials(format!("invalid email: {e}")))?;
-            let db = DB::<Closed, C>::new(crypto_for_verify)
-                .open(&db_path_for_verify)
-                .map_err(|e| auth::AuthError::InvalidCredentials(format!("db error: {e}")))?;
-            db.create_pass(email, password)
-                .map_err(|e| auth::AuthError::InvalidCredentials(e.to_string()))
-        })
-        .map_err(StatusCode::from)?;
+        // Вахтер: JWT-only
+        let pass = auth::guard(&headers, &jwt_secret, &session_store).map_err(StatusCode::from)?;
 
         // Хранилище
         let db = DB::<Closed, C>::new(crypto)
@@ -534,7 +562,7 @@ pub async fn generate_handler(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::auth::JwtSecret;
+    use crate::auth::{FailedLoginTracker, JwtSecret, SessionStore};
     use crate::crypto_operations::FakeCrypto;
     use crate::http_api::AppState;
     use axum::Router;
@@ -569,12 +597,15 @@ mod tests {
                 db_path: db_path.clone(),
                 auth_db_path: auth_db_path.clone(),
                 jwt_secret: Arc::new(JwtSecret::new("test-jwt-secret-for-handlers".to_string())),
+                session_store: SessionStore::new(),
+                failed_login_tracker: FailedLoginTracker::new(),
                 crypto: FakeCrypto,
             };
 
             let router = Router::new()
                 .route("/health", get(health_handler))
                 .route("/login", post(login_handler::<FakeCrypto>))
+                .route("/logout", post(logout_handler::<FakeCrypto>))
                 .route("/refresh", post(refresh_handler::<FakeCrypto>))
                 .route("/register", post(register_handler::<FakeCrypto>))
                 .route("/add", post(add_handler::<FakeCrypto>))
@@ -1002,5 +1033,137 @@ mod tests {
             .unwrap();
         let resp = app.request(req).await;
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    // ════════════════════════════════════════════
+    // Logout (revocation)
+    // ════════════════════════════════════════════
+
+    #[tokio::test]
+    async fn logout_revokes_session() {
+        let app = TestApp::new();
+        let (token, _) = register_and_login(&app).await;
+
+        // Bearer работает до logout
+        let req = Request::builder()
+            .uri("/list")
+            .header("authorization", format!("Bearer {token}"))
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.request(req).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Logout
+        let req = Request::builder()
+            .method("POST")
+            .uri("/logout")
+            .header("authorization", format!("Bearer {token}"))
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.request(req).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Bearer после logout → 401 (SessionExpired)
+        let req = Request::builder()
+            .uri("/list")
+            .header("authorization", format!("Bearer {token}"))
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.request(req).await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn logout_revokes_refresh_token() {
+        let app = TestApp::new();
+        let (access_token, refresh_token) = register_and_login(&app).await;
+
+        // Logout
+        let req = Request::builder()
+            .method("POST")
+            .uri("/logout")
+            .header("authorization", format!("Bearer {access_token}"))
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.request(req).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Refresh после logout → 401 (токен удалён из auth.db)
+        let req = Request::builder()
+            .method("POST")
+            .uri("/refresh")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({
+                    "access_token": access_token,
+                    "refresh_token": refresh_token,
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        let resp = app.request(req).await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn logout_without_token_returns_401() {
+        let app = TestApp::new();
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/logout")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.request(req).await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    // ════════════════════════════════════════════
+    // Brute-force protection
+    // ════════════════════════════════════════════
+
+    #[tokio::test]
+    async fn login_locked_after_max_attempts() {
+        use crate::auth::failed_login_tracker::MAX_FAILED_ATTEMPTS;
+
+        let app = TestApp::new();
+
+        // Register
+        let req = Request::builder()
+            .method("POST")
+            .uri("/register")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"email":"victim@example.com","master_password":"Secret123!"}"#,
+            ))
+            .unwrap();
+        let resp = app.request(req).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // MAX_FAILED_ATTEMPTS раз неверный пароль → 401
+        for _ in 0..MAX_FAILED_ATTEMPTS {
+            let req = Request::builder()
+                .method("POST")
+                .uri("/login")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"email":"victim@example.com","master_password":"WrongPass!"}"#,
+                ))
+                .unwrap();
+            let resp = app.request(req).await;
+            assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        }
+
+        // Следующая попытка (даже с ПРАВИЛЬНЫМ паролем) → 403
+        let req = Request::builder()
+            .method("POST")
+            .uri("/login")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"email":"victim@example.com","master_password":"Secret123!"}"#,
+            ))
+            .unwrap();
+        let resp = app.request(req).await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
     }
 }

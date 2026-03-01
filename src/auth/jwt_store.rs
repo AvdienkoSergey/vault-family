@@ -128,6 +128,22 @@ impl AuthStore {
 
         Ok(UserId::new(user_id))
     }
+
+    /// Удалить все refresh-токены пользователя.
+    ///
+    /// Используется при logout — после вызова ни один refresh_token
+    /// этого пользователя не пройдёт verify_and_delete.
+    /// Возвращает количество удалённых токенов.
+    pub fn delete_all_user_tokens(&self, user_id: &str) -> Result<usize, StoreError> {
+        let deleted = self
+            .conn
+            .execute(
+                "DELETE FROM refresh_tokens WHERE user_id = ?1",
+                rusqlite::params![user_id],
+            )
+            .map_err(|e| StoreError::Database(format!("Failed to delete user tokens: {e}")))?;
+        Ok(deleted)
+    }
 }
 
 // ════════════════════════════════════════════════════════════════════
@@ -196,5 +212,65 @@ mod tests {
 
         let result = store.verify_and_delete_refresh_token(&hash);
         assert!(matches!(result, Err(StoreError::TokenNotFound)));
+    }
+
+    #[test]
+    fn delete_all_user_tokens_clears_tokens() {
+        let store = open_test_store();
+        let user_id = UserId::new("user-1".to_string());
+        let expires = Utc::now() + chrono::Duration::hours(1);
+
+        // Вставляем 2 токена для одного пользователя
+        store
+            .save_refresh_token(
+                &RefreshTokenHash::new("hash-a".to_string()),
+                &user_id,
+                expires,
+            )
+            .unwrap();
+        store
+            .save_refresh_token(
+                &RefreshTokenHash::new("hash-b".to_string()),
+                &user_id,
+                expires,
+            )
+            .unwrap();
+
+        let deleted = store.delete_all_user_tokens("user-1").unwrap();
+        assert_eq!(deleted, 2);
+
+        // Оба токена удалены
+        let result =
+            store.verify_and_delete_refresh_token(&RefreshTokenHash::new("hash-a".to_string()));
+        assert!(matches!(result, Err(StoreError::TokenNotFound)));
+    }
+
+    #[test]
+    fn delete_all_user_tokens_does_not_affect_other_users() {
+        let store = open_test_store();
+        let expires = Utc::now() + chrono::Duration::hours(1);
+
+        store
+            .save_refresh_token(
+                &RefreshTokenHash::new("hash-user1".to_string()),
+                &UserId::new("user-1".to_string()),
+                expires,
+            )
+            .unwrap();
+        store
+            .save_refresh_token(
+                &RefreshTokenHash::new("hash-user2".to_string()),
+                &UserId::new("user-2".to_string()),
+                expires,
+            )
+            .unwrap();
+
+        store.delete_all_user_tokens("user-1").unwrap();
+
+        // user-2 не затронут
+        let id = store
+            .verify_and_delete_refresh_token(&RefreshTokenHash::new("hash-user2".to_string()))
+            .unwrap();
+        assert_eq!(id.as_str(), "user-2");
     }
 }

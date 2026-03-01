@@ -9,7 +9,7 @@ use super::JwtSecret;
 use rand::RngExt;
 use std::fs;
 use std::path::Path;
-use tracing::info;
+use tracing::debug;
 
 /// Загрузить или создать JWT-секрет.
 ///
@@ -18,7 +18,7 @@ use tracing::info;
 pub fn load_or_create_jwt_secret(db_path: &str) -> Result<JwtSecret, std::io::Error> {
     // 1. Проверяем переменную окружения
     if let Ok(secret) = std::env::var("JWT_SECRET") {
-        info!("JWT secret loaded from JWT_SECRET env var");
+        debug!("JWT secret loaded from env var");
         return Ok(JwtSecret::new(secret));
     }
 
@@ -31,7 +31,7 @@ pub fn load_or_create_jwt_secret(db_path: &str) -> Result<JwtSecret, std::io::Er
     if let Ok(secret) = fs::read_to_string(&secret_path) {
         let trimmed = secret.trim();
         if !trimmed.is_empty() {
-            info!("JWT secret loaded from file: {}", secret_path.display());
+            debug!("JWT secret loaded from file");
             return Ok(JwtSecret::new(trimmed.to_string()));
         }
     }
@@ -42,10 +42,7 @@ pub fn load_or_create_jwt_secret(db_path: &str) -> Result<JwtSecret, std::io::Er
     let hex_secret = hex::encode(bytes);
 
     fs::write(&secret_path, &hex_secret)?;
-    info!(
-        "JWT secret generated and saved to: {}",
-        secret_path.display()
-    );
+    debug!("JWT secret generated and saved to file");
 
     Ok(JwtSecret::new(hex_secret))
 }

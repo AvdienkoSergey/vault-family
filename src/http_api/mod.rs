@@ -1,20 +1,23 @@
 mod handlers;
 
 use axum::Router;
+use axum::http::header::AUTHORIZATION;
 use axum::routing::{delete, get, post};
 use tokio::net::TcpListener;
-use tower_http::trace::TraceLayer;
+use tower_http::sensitive_headers::SetSensitiveRequestHeadersLayer;
+use tower_http::trace::{DefaultMakeSpan, DefaultOnRequest, DefaultOnResponse, TraceLayer};
+use tracing::Level;
 use tracing_subscriber::EnvFilter;
 
 use std::sync::Arc;
 
 use crate::auth;
-use crate::auth::JwtSecret;
+use crate::auth::{FailedLoginTracker, JwtSecret, SessionStore};
 use crate::crypto_operations::{CryptoProvider, RealCrypto};
 
 use handlers::{
     add_handler, delete_handler, generate_handler, health_handler, list_handler, login_handler,
-    refresh_handler, register_handler, view_handler,
+    logout_handler, refresh_handler, register_handler, view_handler,
 };
 
 // ════════════════════════════════════════════════════════════════════
@@ -48,6 +51,10 @@ pub(crate) struct AppState<C: CryptoProvider + Clone> {
     pub(crate) auth_db_path: String,
     /// JWT-секрет для подписи токенов
     pub(crate) jwt_secret: Arc<JwtSecret>,
+    /// Серверное хранилище сессий (EncryptionKey в памяти, не в JWT)
+    pub(crate) session_store: SessionStore,
+    /// Трекер неудачных попыток входа (brute-force защита)
+    pub(crate) failed_login_tracker: FailedLoginTracker,
     /// Криптопровайдер
     pub(crate) crypto: C,
 }
@@ -68,7 +75,7 @@ pub async fn run_server(host: &str, port: u16, db_path: String) -> Result<(), Se
         .with_target(false)
         .with_env_filter(
             EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| EnvFilter::new("tower_http=debug")),
+                .unwrap_or_else(|_| EnvFilter::new("vault_family=info,tower_http=info")),
         )
         .compact()
         .init();
@@ -76,6 +83,7 @@ pub async fn run_server(host: &str, port: u16, db_path: String) -> Result<(), Se
     let app: Router = Router::new()
         .route("/health", get(health_handler))
         .route("/login", post(login_handler::<RealCrypto>))
+        .route("/logout", post(logout_handler::<RealCrypto>))
         .route("/refresh", post(refresh_handler::<RealCrypto>))
         .route("/register", post(register_handler::<RealCrypto>))
         .route("/add", post(add_handler::<RealCrypto>))
@@ -83,11 +91,23 @@ pub async fn run_server(host: &str, port: u16, db_path: String) -> Result<(), Se
         .route("/view/{id}", get(view_handler::<RealCrypto>))
         .route("/delete/{id}", delete(delete_handler::<RealCrypto>))
         .route("/generate", get(generate_handler))
-        .layer(TraceLayer::new_for_http())
+        .layer(
+            TraceLayer::new_for_http()
+                .make_span_with(
+                    DefaultMakeSpan::new()
+                        .level(Level::INFO)
+                        .include_headers(false),
+                )
+                .on_request(DefaultOnRequest::new().level(Level::INFO))
+                .on_response(DefaultOnResponse::new().level(Level::INFO)),
+        )
+        .layer(SetSensitiveRequestHeadersLayer::new([AUTHORIZATION]))
         .with_state(AppState {
             db_path,
             auth_db_path,
             jwt_secret: Arc::new(jwt_secret),
+            session_store: SessionStore::new(),
+            failed_login_tracker: FailedLoginTracker::new(),
             crypto: RealCrypto,
         });
 
