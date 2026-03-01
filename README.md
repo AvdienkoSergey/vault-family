@@ -30,7 +30,9 @@ vault-family/
 │   └── http_api/               # HTTP API (axum)
 │       ├── mod.rs              #   Router, AppState, run_server
 │       ├── handlers.rs         #   Handler-функции для всех endpoints
-│       └── extractors.rs       #   Basic Auth extractor
+│       ├── extractors.rs       #   Bearer JWT + Basic Auth extractor
+│       ├── jwt.rs              #   JWT Claims, create/decode access tokens
+│       └── jwt_secret.rs       #   Загрузка/генерация SERVER_SECRET
 ```
 
 Проект разделён на library crate (`lib.rs`) и binary crate (`main.rs`).
@@ -85,10 +87,20 @@ TABLE entries (SQLite)
 ├── created_at          DateTime<Utc>
 └── updated_at          DateTime<Utc>
 
+TABLE refresh_tokens (SQLite)
+├── RefreshTokenHash    branded_secret     SHA-256 хэш токена (PK)
+├── UserId              branded_no_secret  ссылка на users
+└── expires_at          DateTime<Utc>
+
 Только в памяти (никогда не в БД)
 ├── MasterPassword      branded_secret     ввод пользователя
 ├── EncryptionKey       branded_secret     32 байта, деривируется из MasterPassword
 └── EntryPassword       branded_secret     расшифрованный пароль записи
+
+JWT / Сессии
+├── JwtSecret           branded_secret     ключ подписи HMAC-SHA256 (живёт в AppState)
+├── RefreshToken        branded_secret     opaque UUID, отдаётся клиенту
+└── RefreshTokenHash    branded_secret     SHA-256 хэш, хранится в БД
 
 Поля записей
 ├── ServiceName         branded_no_secret  "Hetzner Cloud"
@@ -99,10 +111,11 @@ TABLE entries (SQLite)
 ### Доменные структуры
 
 ```
-User                    строка из TABLE users
+User                    полная строка из TABLE users (используется при регистрации)
+SessionUser             id + email (минимум для активной сессии, без хэшей и солей)
 PlainEntry              расшифрованная запись (только в памяти)
 EncryptedEntry          зашифрованная запись (TABLE entries)
-AuthSession             User + EncryptionKey (результат логина)
+AuthSession             SessionUser + EncryptionKey (результат логина)
 ```
 
 ## Криптография
@@ -230,17 +243,65 @@ vault-family serve --host 0.0.0.0 --port 8080
 
 ## HTTP API
 
-HTTP API — полное зеркало CLI. Каждый запрос создаёт свой lifecycle `DB<Closed> → DB<Open> → DB<Authenticated> → drop`. Stateless — аутентификация на каждый запрос через Basic Auth.
+HTTP API — полное зеркало CLI. Аутентификация через JWT-сессии (access + refresh токены). Basic Auth сохранён как fallback для CLI-совместимости.
+
+### Аутентификация
+
+```
+POST /login  →  {access_token (JWT, 15 мин), refresh_token (opaque, 7 дней)}
+
+Защищённые эндпоинты принимают:
+  1. Authorization: Bearer <access_token>     ← PWA/мобильное приложение
+  2. Authorization: Basic <base64>            ← CLI fallback
+
+POST /refresh  →  новая пара {access_token, refresh_token}
+  Принимает: {refresh_token, access_token (истёкший)}
+  Rotation: старый refresh_token удаляется из БД
+```
+
+#### JWT Claims (access_token)
+
+```
+{ sub: "user-uuid", email: "...", ek: "hex-encryption-key", exp: unix_timestamp }
+```
+
+`ek` (encryption_key) передаётся внутри JWT payload — сервер не хранит ключ шифрования между запросами. Zero-knowledge принцип сохранён: сервер извлекает `ek` из JWT, использует для шифрования/расшифровки, дропает.
+
+#### JWT Secret
+
+Загрузка при старте сервера (приоритет):
+
+```
+1. env JWT_SECRET          → production (задаётся в docker-compose.yml)
+2. файл {db_dir}/.jwt_secret  → development (создаётся автоматически)
+3. генерация 64 random bytes  → первый запуск (сохраняется в файл)
+```
+
+#### Refresh Token Rotation
+
+```
+Клиент → POST /refresh {refresh_token, access_token}
+Сервер:
+  1. Декодирует access_token БЕЗ проверки exp (подпись проверяется)
+  2. SHA-256(refresh_token) → ищет в БД
+  3. Удаляет использованный refresh_token (rotation)
+  4. Создаёт новую пару access + refresh
+  5. Возвращает клиенту
+```
+
+Rotation защищает от кражи: если атакующий использует украденный refresh_token, легитимный пользователь получит ошибку при следующем refresh.
 
 ### Endpoints
 
 ```
 GET    /health              — проверка жизни сервера (без аутентификации)
 POST   /register            — регистрация нового пользователя (JSON body)
-POST   /add                 — добавить запись (Basic Auth + JSON body)
-GET    /list                — список всех записей (Basic Auth)
-GET    /view/{id}           — просмотр записи с расшифровкой (Basic Auth)
-DELETE /delete/{id}         — удалить запись (Basic Auth)
+POST   /login               — аутентификация, получение токенов (JSON body)
+POST   /refresh             — обновление токенов (JSON body)
+POST   /add                 — добавить запись (Bearer / Basic + JSON body)
+GET    /list                — список всех записей (Bearer / Basic)
+GET    /view/{id}           — просмотр записи с расшифровкой (Bearer / Basic)
+DELETE /delete/{id}         — удалить запись (Bearer / Basic)
 GET    /generate            — генерация пароля (без аутентификации, query params)
 ```
 
@@ -252,20 +313,34 @@ curl -X POST http://127.0.0.1:3000/register \
   -H "Content-Type: application/json" \
   -d '{"email": "user@example.com", "master_password": "Secret123!"}'
 
-# Добавить запись
-curl -u "user@example.com:Secret123!" \
-  -X POST http://127.0.0.1:3000/add \
+# Логин (получить токены)
+curl -X POST http://127.0.0.1:3000/login \
+  -H "Content-Type: application/json" \
+  -d '{"email": "user@example.com", "master_password": "Secret123!"}'
+# → {"access_token": "eyJ...", "refresh_token": "550e8400-..."}
+
+# Добавить запись (Bearer JWT)
+curl -X POST http://127.0.0.1:3000/add \
+  -H "Authorization: Bearer eyJ..." \
   -H "Content-Type: application/json" \
   -d '{"service_name":"GitHub","service_url":"https://github.com","login":"myuser","password":"ghpass123","notes":"work"}'
 
-# Список записей
+# Список записей (Bearer JWT)
+curl -H "Authorization: Bearer eyJ..." http://127.0.0.1:3000/list
+
+# Список записей (Basic Auth fallback для CLI)
 curl -u "user@example.com:Secret123!" http://127.0.0.1:3000/list
 
 # Просмотр записи
-curl -u "user@example.com:Secret123!" http://127.0.0.1:3000/view/<entry-id>
+curl -H "Authorization: Bearer eyJ..." http://127.0.0.1:3000/view/<entry-id>
 
 # Удалить запись
-curl -u "user@example.com:Secret123!" -X DELETE http://127.0.0.1:3000/delete/<entry-id>
+curl -H "Authorization: Bearer eyJ..." -X DELETE http://127.0.0.1:3000/delete/<entry-id>
+
+# Обновить токены
+curl -X POST http://127.0.0.1:3000/refresh \
+  -H "Content-Type: application/json" \
+  -d '{"refresh_token": "550e8400-...", "access_token": "eyJ..."}'
 
 # Генерация пароля (все параметры опциональны)
 curl "http://127.0.0.1:3000/generate?length=32&symbols=false"
@@ -273,25 +348,34 @@ curl "http://127.0.0.1:3000/generate?length=32&symbols=false"
 
 ### Архитектурные решения
 
-- **Stateless** — email + master_password на каждый запрос (Basic Auth). Нет сессий, нет токенов, нет состояния на сервере
+- **JWT-сессии** — master_password передаётся только при `/login`; все последующие запросы используют краткосрочный access_token (15 мин)
+- **Bearer + Basic fallback** — PWA использует JWT, CLI может использовать Basic Auth для обратной совместимости
+- **Zero-knowledge** — encryption_key передаётся внутри JWT payload, сервер не хранит его между запросами
+- **Refresh rotation** — каждый `/refresh` инвалидирует старый токен, защищая от кражи
 - **spawn_blocking** — все DB-операции в blocking closure, т.к. `rusqlite::Connection` не реализует `Send`
-- **Typestate сохранён** — каждый запрос проходит полный lifecycle: `DB<Closed> → DB<Open> → DB<Authenticated> → drop`
+- **Typestate сохранён** — каждый запрос проходит lifecycle: `DB<Closed> → DB<Open> → restore_session() → DB<Authenticated> → drop`
 - **Tracing** — `tower_http::TraceLayer` логирует метод, путь, статус и latency каждого запроса
 
 ## Typestate: DB
 
 ```
 DB<Closed>  →  DB<Open>  →  DB<Authenticated>
-   new()         open()        authenticate()
+   new()         open()        authenticate()        ← с паролем (CLI, /login)
+                    │           restore_session()     ← из JWT claims (Bearer auth)
                     │               │
                     │               ├── save_entry()
                     ├── create_user()   list_entries()
                     ├── authenticate()  delete_entry()
-                    │
+                    ├── restore_session()  encrypt() / decrypt()
+                    │                   save_refresh_token()
                     │  Нельзя:
                     │  db_open.save_entry()     ← ошибка компиляции
                     │  db_closed.create_user()  ← ошибка компиляции
 ```
+
+Два пути в `Authenticated`:
+- `authenticate(email, password)` — проверяет PBKDF2, деривирует encryption_key (CLI, `/login`)
+- `restore_session(user_id, encryption_key)` — восстанавливает сессию из JWT claims (Bearer auth). Проверяет существование пользователя в БД, но не требует пароль
 
 Каждый переход **потребляет** предыдущее состояние (move semantics).
 После `authenticate()` нельзя вызвать `create_user()` — `DB<Open>` больше не существует.
@@ -361,7 +445,7 @@ decrypt_entry(&EncryptedEntry, &EncryptionKey) → PlainEntry
 
 ## Тесты
 
-50 unit-тестов покрывают все модули:
+83 unit-теста покрывают все модули:
 
 ```
 cargo test
@@ -373,13 +457,19 @@ types::tests                      (5 тестов)  — Email::parse()
 ├── parse_whitespace_only_fails
 └── parse_invalid_rejected
 
-sqlite::tests                     (6 тестов)  — FakeCrypto
+sqlite::tests                     (10 тестов) — FakeCrypto
 ├── open_database
 ├── authenticate
 ├── wrong_password
 ├── save_and_read_entry
 ├── delete_entry
-└── user_isolation
+├── user_isolation
+├── save_and_verify_refresh_token
+├── verify_deletes_token (rotation)
+├── verify_expired_token_fails
+├── verify_nonexistent_token_fails
+├── restore_session_works
+└── restore_session_nonexistent_user_fails
 
 crypto_operations::tests          (15 тестов) — RealCrypto
 ├── generate_salt (hex format, uniqueness)
@@ -395,11 +485,46 @@ password_generator::tests         (24 теста)
 ├── builder chain (has_*, combinations, length + charset)
 ├── generate (correct length, charset compliance, uniqueness, variety)
 └── secure (preset length 20, all charsets)
+
+http_api::jwt::tests              (5 тестов)  — JWT encode/decode
+├── create_and_decode_roundtrip
+├── decode_rejects_wrong_secret
+├── decode_rejects_expired_token
+├── decode_allow_expired_accepts_expired
+└── decode_allow_expired_rejects_wrong_secret
+
+http_api::extractors::tests       (5 тестов)  — Bearer/Basic extraction
+├── extract_bearer_valid
+├── extract_bearer_missing_header
+├── extract_bearer_basic_header_fails
+├── extract_basic_valid
+└── extract_basic_no_colon_fails
+
+http_api::handlers::tests         (19 тестов) — Integration (FakeCrypto + TestApp)
+├── health_returns_ok
+├── generate_returns_password_of_requested_length
+├── register_creates_user
+├── register_invalid_email_returns_400
+├── login_returns_tokens
+├── login_wrong_password_returns_401
+├── login_nonexistent_user_returns_401
+├── add_with_bearer_token
+├── list_returns_added_entries
+├── view_returns_entry_details
+├── delete_removes_entry
+├── view_nonexistent_entry_returns_404
+├── list_without_token_returns_401
+├── add_without_token_returns_401
+├── refresh_returns_new_tokens
+├── refresh_invalidates_old_token (rotation)
+└── refresh_with_wrong_token_returns_401
 ```
 
 `CryptoProvider` trait позволяет тестировать DB-логику без реальной криптографии:
 - `FakeCrypto` (`#[cfg(test)]`) — детерминированный, мгновенный
 - `RealCrypto` — PBKDF2 600K итераций, AES-256-GCM (~60с на тест с derive_key)
+
+Handler-тесты используют `TestApp` — in-process HTTP через `tower::ServiceExt::oneshot()`, без сетевого стека.
 
 ## Зависимости
 
@@ -432,7 +557,9 @@ tokio = { version = "1.49", features = ["rt-multi-thread", "macros"] }  # Async 
 axum = "0.8"                                                             # HTTP фреймворк
 tower-http = { version = "0.6", features = ["cors", "trace"] }          # HTTP middleware
 tracing-subscriber = { features = ["env-filter"] }                       # Логирование
+tracing = "0.1"                                                          # Макросы info!, warn!, error!
 base64 = "0.22"                                                          # Basic Auth декодирование
+jsonwebtoken = { version = "10", features = ["rust_crypto"] }            # JWT encode/decode (HS256)
 ```
 
 ## CI / CD
@@ -477,8 +604,12 @@ style: описание     → без bump
 - [x] CLI интерфейс (clap + rpassword)
 - [x] Library crate (lib.rs) для переиспользования core-логики
 - [x] Email валидация по RFC 5321/5322 (email_address crate)
-- [x] Unit-тесты (50 тестов: types, sqlite, crypto_operations, password_generator)
-- [x] HTTP API (axum): 7 endpoints, Basic Auth, spawn_blocking, tracing
+- [x] Unit-тесты (83 теста: types, sqlite, crypto, password_generator, jwt, extractors, handlers)
+- [x] HTTP API (axum): 9 endpoints, spawn_blocking, tracing
+- [x] JWT-сессии: access_token (15 мин) + refresh_token (7 дней) с rotation
+- [x] Bearer + Basic Auth fallback (CLI-совместимость)
+- [x] Zero-knowledge: encryption_key в JWT payload, сервер не хранит между запросами
+- [x] JWT Secret: env var → файл → автогенерация
 - [ ] PWA фронтенд с E2E шифрованием в браузере
 - [ ] Деплой на Hetzner CX23 Helsinki
 - [ ] Браузерное расширение с автозаполнением
