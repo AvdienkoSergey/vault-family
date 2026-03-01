@@ -1,7 +1,4 @@
-mod extractors;
 mod handlers;
-pub mod jwt;
-pub mod jwt_secret;
 
 use axum::Router;
 use axum::routing::{delete, get, post};
@@ -11,8 +8,9 @@ use tracing_subscriber::EnvFilter;
 
 use std::sync::Arc;
 
+use crate::auth;
+use crate::auth::JwtSecret;
 use crate::crypto_operations::{CryptoProvider, RealCrypto};
-use crate::types::JwtSecret;
 
 use handlers::{
     add_handler, delete_handler, generate_handler, health_handler, list_handler, login_handler,
@@ -44,8 +42,13 @@ impl std::fmt::Display for ServerError {
 
 #[derive(Clone)]
 pub(crate) struct AppState<C: CryptoProvider + Clone> {
+    /// Путь к vault.db (пользователи + записи)
     pub(crate) db_path: String,
+    /// Путь к auth.db (refresh-токены)
+    pub(crate) auth_db_path: String,
+    /// JWT-секрет для подписи токенов
     pub(crate) jwt_secret: Arc<JwtSecret>,
+    /// Криптопровайдер
     pub(crate) crypto: C,
 }
 
@@ -56,8 +59,10 @@ pub(crate) struct AppState<C: CryptoProvider + Clone> {
 pub async fn run_server(host: &str, port: u16, db_path: String) -> Result<(), ServerError> {
     let socket_address = format!("{}:{}", &host, &port);
 
-    let jwt_secret = jwt_secret::load_or_create_jwt_secret(&db_path)
+    let jwt_secret = auth::jwt_secret::load_or_create_jwt_secret(&db_path)
         .map_err(|e| ServerError::Connection(format!("Failed to load JWT secret: {e}")))?;
+
+    let auth_db_path = auth::auth_db_path(&db_path);
 
     tracing_subscriber::fmt()
         .with_target(false)
@@ -67,6 +72,7 @@ pub async fn run_server(host: &str, port: u16, db_path: String) -> Result<(), Se
         )
         .compact()
         .init();
+
     let app: Router = Router::new()
         .route("/health", get(health_handler))
         .route("/login", post(login_handler::<RealCrypto>))
@@ -80,6 +86,7 @@ pub async fn run_server(host: &str, port: u16, db_path: String) -> Result<(), Se
         .layer(TraceLayer::new_for_http())
         .with_state(AppState {
             db_path,
+            auth_db_path,
             jwt_secret: Arc::new(jwt_secret),
             crypto: RealCrypto,
         });

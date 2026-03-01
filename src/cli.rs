@@ -6,11 +6,11 @@ use uuid::Uuid;
 
 use crate::crypto_operations::RealCrypto;
 use crate::password_generator::{Empty, PasswordGenerator};
-use crate::sqlite::{Authenticated, Closed, DB};
 use crate::types::{
     Email, EntryId, EntryPassword, Login, MasterPassword, PlainEntry, ServiceName, ServiceUrl,
     UserId,
 };
+use crate::vault::{Authenticated, Closed, DB};
 
 #[derive(Parser)]
 #[command(name = "vault-family", about = "Type-safe password manager")]
@@ -157,7 +157,8 @@ fn open_and_authenticate(
 
     let db = DB::<Closed, RealCrypto>::new(RealCrypto).open(db_path)?;
 
-    let db = db.authenticate(email, MasterPassword::new(master))?;
+    let pass = db.create_pass(email, MasterPassword::new(master))?;
+    let db = db.enter(pass)?;
 
     Ok(db)
 }

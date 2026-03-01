@@ -116,6 +116,51 @@ mod tests {
     fn parse_invalid_rejected() {
         assert!(Email::parse("not-an-email".to_string()).is_err());
     }
+
+    // ════════════════════════════════════════════
+    // VaultPass — Пропуск
+    // ════════════════════════════════════════════
+
+    #[test]
+    fn vault_pass_accessors() {
+        let pass = VaultPass::new(
+            UserId::new("user-1".to_string()),
+            Email::new("alex@icloud.com".to_string()),
+            EncryptionKey::new("0".repeat(64)),
+        );
+
+        assert_eq!(pass.user_id().as_str(), "user-1");
+        assert_eq!(pass.email().as_str(), "alex@icloud.com");
+        assert_eq!(pass.encryption_key().as_str(), "0".repeat(64));
+    }
+
+    #[test]
+    fn vault_pass_into_parts() {
+        let pass = VaultPass::new(
+            UserId::new("user-1".to_string()),
+            Email::new("alex@icloud.com".to_string()),
+            EncryptionKey::new("abc123".to_string()),
+        );
+
+        let (uid, email, ek) = pass.into_parts();
+        assert_eq!(uid.as_str(), "user-1");
+        assert_eq!(email.as_str(), "alex@icloud.com");
+        assert_eq!(ek.as_str(), "abc123");
+    }
+
+    #[test]
+    fn vault_pass_debug_hides_secrets() {
+        let pass = VaultPass::new(
+            UserId::new("user-1".to_string()),
+            Email::new("alex@icloud.com".to_string()),
+            EncryptionKey::new("super-secret-key".to_string()),
+        );
+
+        let debug = format!("{:?}", pass);
+        assert!(debug.contains("user-1")); // user_id — не секрет
+        assert!(!debug.contains("alex@icloud.com")); // email скрыт
+        assert!(!debug.contains("super-secret-key")); // ek скрыт
+    }
 }
 
 branded_secret!(MasterPasswordHash); // users.master_password_hash
@@ -189,10 +234,54 @@ pub struct AuthSession {
     pub key: EncryptionKey,
 }
 // ════════════════════════════════════════════════════════════════════
-// Branded types - привязаны к JWT
+// VaultPass — Пропуск между Вахтером (auth) и Хранилищем (vault)
 // ════════════════════════════════════════════════════════════════════
-// JWT
-branded_secret!(JwtSecret); // ключ подписи (живёт в AppState)
-// Refresh tokens
-branded_secret!(RefreshToken); // opaque токен, отдаётся клиенту
-branded_secret!(RefreshTokenHash); // SHA-256 хэш, хранится в БД
+/// Пропуск — результат любой успешной аутентификации.
+///
+/// Вахтер (auth/) **создаёт** VaultPass после проверки личности:
+/// JWT, Basic Auth, OAuth — неважно как.
+///
+/// Хранилище (vault/) **принимает** VaultPass через `enter()`:
+/// не зная и не спрашивая, как именно пользователь прошёл проверку.
+///
+/// Не Clone, не Serialize — пропуск нельзя скопировать или случайно
+/// отправить по сети. EncryptionKey зануляется при drop (ZeroizeOnDrop).
+pub struct VaultPass {
+    user_id: UserId,
+    email: Email,
+    encryption_key: EncryptionKey,
+}
+
+impl VaultPass {
+    pub fn new(user_id: UserId, email: Email, encryption_key: EncryptionKey) -> Self {
+        Self {
+            user_id,
+            email,
+            encryption_key,
+        }
+    }
+    pub fn user_id(&self) -> &UserId {
+        &self.user_id
+    }
+    pub fn email(&self) -> &Email {
+        &self.email
+    }
+    pub fn encryption_key(&self) -> &EncryptionKey {
+        &self.encryption_key
+    }
+    /// Деструктурирует пропуск, отдавая владение полями.
+    /// Нужен для vault.enter(), который забирает EncryptionKey в сессию.
+    pub fn into_parts(self) -> (UserId, Email, EncryptionKey) {
+        (self.user_id, self.email, self.encryption_key)
+    }
+}
+
+impl fmt::Debug for VaultPass {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("VaultPass")
+            .field("user_id", &self.user_id)
+            .field("email", &"***")
+            .field("encryption_key", &"***")
+            .finish()
+    }
+}

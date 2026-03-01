@@ -1,3 +1,11 @@
+//! Модуль Хранилище — работа с пользователями и зашифрованными записями.
+//!
+//! Typestate-машина БД:
+//!   DB<Closed> → open() → DB<Open> → enter(VaultPass) → DB<Authenticated>
+//!
+//! **Не знает про JWT, refresh-токены, HTTP.**
+//! Единственный вход в Authenticated — через `VaultPass` (Пропуск).
+
 use crate::crypto_operations::{CryptoError, CryptoProvider};
 use crate::types;
 use crate::types::{AuthSalt, EncryptedData, EncryptionSalt, MasterPasswordHash, Nonce};
@@ -5,41 +13,58 @@ use chrono::Utc;
 use rusqlite::Connection;
 use std::marker::PhantomData;
 use types::{
-    AuthSession, Email, EncryptedEntry, EntryId, MasterPassword, PlainEntry, RefreshTokenHash,
-    User, UserId,
+    AuthSession, Email, EncryptedEntry, EntryId, MasterPassword, PlainEntry, User, UserId,
+    VaultPass,
 };
 use uuid::Uuid;
+
+// ════════════════════════════════════════════════════════════════════
+// Typestate: Closed → Open → Authenticated
+// ════════════════════════════════════════════════════════════════════
+
 mod sealed {
     pub trait Sealed {}
 }
+
 pub struct Closed;
 pub struct Open;
 pub struct Authenticated;
+
 pub trait ConnectionState: sealed::Sealed {
     type Conn;
     type Session;
 }
+
 impl sealed::Sealed for Closed {}
 impl sealed::Sealed for Open {}
 impl sealed::Sealed for Authenticated {}
+
 impl ConnectionState for Closed {
     type Conn = ();
     type Session = ();
 }
+
 impl ConnectionState for Open {
     type Conn = Connection;
     type Session = ();
 }
+
 impl ConnectionState for Authenticated {
     type Conn = Connection;
     type Session = AuthSession;
 }
+
 pub struct DB<State: ConnectionState, C: CryptoProvider> {
     conn: State::Conn,
     session: State::Session,
     crypto: C,
     _state: PhantomData<State>,
 }
+
+// ════════════════════════════════════════════════════════════════════
+// Errors
+// ════════════════════════════════════════════════════════════════════
+
 #[derive(Debug)]
 pub enum VaultError {
     Connection(String),
@@ -48,6 +73,7 @@ pub enum VaultError {
     Auth(String),
     Crypto(CryptoError),
 }
+
 impl std::fmt::Display for VaultError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -59,13 +85,19 @@ impl std::fmt::Display for VaultError {
         }
     }
 }
+
 impl From<CryptoError> for VaultError {
     fn from(err: CryptoError) -> Self {
         VaultError::Crypto(err)
     }
 }
+
 impl std::error::Error for VaultError {}
-/// Closed: можно только создать и открыть
+
+// ════════════════════════════════════════════════════════════════════
+// Closed: создать и открыть
+// ════════════════════════════════════════════════════════════════════
+
 impl<C: CryptoProvider> DB<Closed, C> {
     pub fn new(crypto: C) -> Self {
         Self {
@@ -75,13 +107,17 @@ impl<C: CryptoProvider> DB<Closed, C> {
             _state: PhantomData,
         }
     }
+
     /// Closed → Open (потребляет self!)
+    ///
+    /// Схема: только users + entries. Никаких refresh_tokens —
+    /// это забота модуля auth/.
     pub fn open(self, path: &str) -> Result<DB<Open, C>, VaultError> {
         let crypto = self.crypto;
         let conn = Connection::open(path)
             .map_err(|e| VaultError::Connection(format!("Unable to open database: {}", e)))?;
 
-        let create_tables = conn.execute_batch(
+        conn.execute_batch(
             "BEGIN;
             CREATE TABLE IF NOT EXISTS users (
                 id              TEXT PRIMARY KEY,
@@ -99,20 +135,9 @@ impl<C: CryptoProvider> DB<Closed, C> {
                 created_at      TEXT NOT NULL,
                 updated_at      TEXT NOT NULL
             );
-            CREATE TABLE IF NOT EXISTS refresh_tokens (
-                token_hash      TEXT PRIMARY KEY,
-                user_id         TEXT NOT NULL,
-                expires_at      TEXT NOT NULL
-            );
             COMMIT;",
-        );
-
-        if let Err(e) = create_tables {
-            return Err(VaultError::Schema(format!(
-                "Failed to create tables: {}",
-                e
-            )));
-        }
+        )
+        .map_err(|e| VaultError::Schema(format!("Failed to create tables: {}", e)))?;
 
         Ok(DB {
             conn,
@@ -122,9 +147,13 @@ impl<C: CryptoProvider> DB<Closed, C> {
         })
     }
 }
-/// Open: регистрация и логин
+
+// ════════════════════════════════════════════════════════════════════
+// Open: регистрация, выдача пропуска, вход
+// ════════════════════════════════════════════════════════════════════
+
 impl<C: CryptoProvider> DB<Open, C> {
-    /// Создать пользователя (регистрация, не требует логина)
+    /// Создать пользователя (регистрация, не требует логина).
     pub fn create_user(
         &self,
         email: Email,
@@ -136,7 +165,7 @@ impl<C: CryptoProvider> DB<Open, C> {
         let encryption_salt = crypto.generate_salt();
         let created_at = Utc::now();
 
-        let user: User = User {
+        let user = User {
             id,
             email,
             master_hash,
@@ -147,10 +176,8 @@ impl<C: CryptoProvider> DB<Open, C> {
 
         self.conn
             .execute(
-                "
-            INSERT INTO users (id, email, master_hash, auth_salt, encryption_salt, created_at)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6);
-        ",
+                "INSERT INTO users (id, email, master_hash, auth_salt, encryption_salt, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6);",
                 (
                     user.id.as_str(),
                     user.email.as_str(),
@@ -165,22 +192,31 @@ impl<C: CryptoProvider> DB<Open, C> {
         Ok(user)
     }
 
-    /// Open → Authenticated (потребляет self!)
-    pub fn authenticate(
-        self,
+    /// Проверить пароль и выдать Пропуск (VaultPass).
+    ///
+    /// **Заимствует `&self`** — не потребляет DB.
+    /// После получения пропуска вызывайте `enter()`.
+    ///
+    /// ```ignore
+    /// let pass = db.create_pass(email, password)?;
+    /// let db = db.enter(pass)?;
+    /// ```
+    pub fn create_pass(
+        &self,
         email: Email,
         master_password: MasterPassword,
-    ) -> Result<DB<Authenticated, C>, VaultError> {
-        let conn = self.conn;
-        let crypto = self.crypto;
+    ) -> Result<VaultPass, VaultError> {
+        let crypto = &self.crypto;
+
         let user = {
-            let mut stmt = conn
+            let mut stmt = self
+                .conn
                 .prepare(
-                    "
-            SELECT id, email, master_hash, auth_salt, encryption_salt, created_at
-            FROM users WHERE email = ?1",
+                    "SELECT id, email, master_hash, auth_salt, encryption_salt, created_at
+                     FROM users WHERE email = ?1",
                 )
                 .map_err(|e| VaultError::Database(format!("Failed to prepare statement: {}", e)))?;
+
             stmt.query_row(rusqlite::params![email.as_str()], |row| {
                 Ok(User {
                     id: UserId::new(row.get(0)?),
@@ -194,37 +230,31 @@ impl<C: CryptoProvider> DB<Open, C> {
                         .unwrap_or_else(|_| Utc::now()),
                 })
             })
-            .map_err(|e| VaultError::Database(format!("Failed to get user ID: {}", e)))?
+            .map_err(|e| VaultError::Database(format!("User not found: {}", e)))?
         };
+
         let is_verify =
             crypto.verify_master_password(&master_password, &user.master_hash, &user.auth_salt)?;
         if !is_verify {
             return Err(VaultError::Auth("Invalid master password".to_string()));
         }
+
         let key = crypto.derive_encryption_key(&master_password, &user.encryption_salt);
-        let session_user = types::SessionUser {
-            id: user.id,
-            email: user.email,
-        };
-        Ok(DB {
-            conn,
-            session: AuthSession {
-                user: session_user,
-                key,
-            },
-            crypto,
-            _state: PhantomData,
-        })
+
+        Ok(VaultPass::new(user.id, user.email, key))
     }
-    /// Open → Authenticated БЕЗ проверки пароля.
-    /// JWT уже доказал что пользователь аутентифицирован —
-    /// восстанавливаем сессию из проверенных claims.
-    pub fn restore_session(
-        self,
-        user_id: UserId,
-        encryption_key: types::EncryptionKey,
-    ) -> Result<DB<Authenticated, C>, VaultError> {
+
+    /// Войти в Хранилище с Пропуском.
+    ///
+    /// **Потребляет self** — DB переходит в Authenticated.
+    /// Проверяет что пользователь существует в vault.db.
+    ///
+    /// Не знает КАК был получен пропуск — это дело Вахтера.
+    pub fn enter(self, pass: VaultPass) -> Result<DB<Authenticated, C>, VaultError> {
         let conn = self.conn;
+        let (user_id, _pass_email, encryption_key) = pass.into_parts();
+
+        // Проверяем что user существует и берём актуальные данные из БД
         let user = {
             let mut stmt = conn
                 .prepare("SELECT id, email FROM users WHERE id = ?1")
@@ -237,6 +267,7 @@ impl<C: CryptoProvider> DB<Open, C> {
             })
             .map_err(|e| VaultError::Database(format!("User not found: {e}")))?
         };
+
         Ok(DB {
             conn,
             session: AuthSession {
@@ -247,57 +278,22 @@ impl<C: CryptoProvider> DB<Open, C> {
             _state: PhantomData,
         })
     }
-    /// Проверить refresh-токен и удалить (rotation).
-    /// Возвращает user_id владельца токена.
-    pub fn verify_and_delete_refresh_token(
-        &self,
-        token_hash: &RefreshTokenHash,
-    ) -> Result<UserId, VaultError> {
-        let (user_id, expires_at): (String, String) = self
-            .conn
-            .query_row(
-                "SELECT user_id, expires_at FROM refresh_tokens WHERE token_hash = ?1",
-                rusqlite::params![token_hash.as_str()],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .map_err(|_| VaultError::Auth("Refresh token not found".to_string()))?;
-
-        let expires = expires_at
-            .parse::<chrono::DateTime<Utc>>()
-            .map_err(|e| VaultError::Database(format!("Invalid expires_at: {e}")))?;
-
-        if expires < Utc::now() {
-            // Удаляем протухший токен
-            let _ = self.conn.execute(
-                "DELETE FROM refresh_tokens WHERE token_hash = ?1",
-                rusqlite::params![token_hash.as_str()],
-            );
-            return Err(VaultError::Auth("Refresh token expired".to_string()));
-        }
-
-        // Rotation: удаляем использованный токен
-        self.conn
-            .execute(
-                "DELETE FROM refresh_tokens WHERE token_hash = ?1",
-                rusqlite::params![token_hash.as_str()],
-            )
-            .map_err(|e| VaultError::Database(format!("Failed to delete refresh token: {e}")))?;
-
-        Ok(UserId::new(user_id))
-    }
 }
-/// Authenticated: работа с записями
+
+// ════════════════════════════════════════════════════════════════════
+// Authenticated: работа с записями
+// ════════════════════════════════════════════════════════════════════
+
 impl<C: CryptoProvider> DB<Authenticated, C> {
-    /// Принимает ТОЛЬКО EncryptedEntry
-    /// PlainEntry передать невозможно — ошибка компиляции
+    /// Принимает ТОЛЬКО EncryptedEntry.
+    /// PlainEntry передать невозможно — ошибка компиляции.
     pub fn save_entry(&self, entry: &EncryptedEntry) -> Result<(), VaultError> {
         self.conn
             .execute(
-                "
-            INSERT INTO entries (id, user_id, encrypted_data, nonce, created_at, updated_at)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-            ON CONFLICT(id) DO UPDATE SET
-            encrypted_data = ?3, nonce = ?4, updated_at = ?6",
+                "INSERT INTO entries (id, user_id, encrypted_data, nonce, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                 ON CONFLICT(id) DO UPDATE SET
+                 encrypted_data = ?3, nonce = ?4, updated_at = ?6",
                 rusqlite::params![
                     entry.id.as_str(),
                     self.session.user.id.as_str(),
@@ -311,16 +307,17 @@ impl<C: CryptoProvider> DB<Authenticated, C> {
 
         Ok(())
     }
-    /// Возвращает зашифрованные записи
+
+    /// Возвращает зашифрованные записи пользователя.
     pub fn list_entries(&self, user_id: &UserId) -> Result<Vec<EncryptedEntry>, VaultError> {
-        let conn = &self.conn;
-        let mut stmt = conn
+        let mut stmt = self
+            .conn
             .prepare(
-                "
-            SELECT id, user_id, encrypted_data, nonce, created_at, updated_at
-            FROM entries WHERE user_id = ?1",
+                "SELECT id, user_id, encrypted_data, nonce, created_at, updated_at
+                 FROM entries WHERE user_id = ?1",
             )
             .map_err(|e| VaultError::Database(format!("Failed to prepare statement: {}", e)))?;
+
         let rows_iter = stmt
             .query_map(rusqlite::params![user_id.as_str()], |row| {
                 Ok(EncryptedEntry {
@@ -339,6 +336,7 @@ impl<C: CryptoProvider> DB<Authenticated, C> {
                 })
             })
             .map_err(|e| VaultError::Database(format!("Failed to query entries: {}", e)))?;
+
         let mut entries = Vec::new();
         for row in rows_iter {
             let entry =
@@ -347,77 +345,68 @@ impl<C: CryptoProvider> DB<Authenticated, C> {
         }
         Ok(entries)
     }
-    /// Удалить запись — нужны оба ID чтобы не удалить чужую
+
+    /// Удалить запись — нужны оба ID чтобы не удалить чужую.
     pub fn delete_entry(&self, entry_id: &EntryId) -> Result<bool, VaultError> {
         let affected = self
             .conn
             .execute(
                 "DELETE FROM entries WHERE id = ?1 AND user_id = ?2",
-                rusqlite::params![entry_id.as_str(), self.session.user.id.as_str(),],
+                rusqlite::params![entry_id.as_str(), self.session.user.id.as_str()],
             )
             .map_err(|e| VaultError::Database(format!("Failed to delete entry: {}", e)))?;
 
         Ok(affected > 0)
     }
-    /// Зашифровать запись для сохранения в БД
-    /// Использует EncryptionKey из текущей сессии
-    /// PlainEntry → EncryptedEntry (готова к save_entry)
+
+    /// Зашифровать запись для сохранения в БД.
+    /// PlainEntry → EncryptedEntry (готова к save_entry).
     pub fn encrypt(&self, entry: &PlainEntry) -> Result<EncryptedEntry, VaultError> {
         self.crypto
             .encrypt_entry(entry, &self.session.key)
             .map_err(VaultError::Crypto)
     }
-    /// Расшифровать запись из БД для показа пользователю
-    /// Использует EncryptionKey из текущей сессии
-    /// EncryptedEntry → PlainEntry (можно читать через .as_str())
+
+    /// Расшифровать запись из БД для показа пользователю.
+    /// EncryptedEntry → PlainEntry.
     pub fn decrypt(&self, entry: &EncryptedEntry) -> Result<PlainEntry, VaultError> {
         self.crypto
             .decrypt_entry(entry, &self.session.key)
             .map_err(VaultError::Crypto)
     }
-    /// Accessor-метод для доступа к приватному полю session.user.id
+
+    /// Accessor: user_id текущей сессии.
     pub fn user_id(&self) -> &UserId {
         &self.session.user.id
     }
-    /// Accessor-метод для доступа к приватному полю session.user.email
+
+    /// Accessor: email текущей сессии.
     pub fn user_email(&self) -> &Email {
         &self.session.user.email
     }
-    /// Ссылка на encryption key сессии
+
+    /// Accessor: encryption key текущей сессии.
     pub fn encryption_key(&self) -> &types::EncryptionKey {
         &self.session.key
     }
-    /// Сохранить хеш refresh-токена в БД
-    pub fn save_refresh_token(
-        &self,
-        token_hash: &RefreshTokenHash,
-        expires_at: chrono::DateTime<Utc>,
-    ) -> Result<(), VaultError> {
-        self.conn
-            .execute(
-                "INSERT INTO refresh_tokens (token_hash, user_id, expires_at) VALUES (?1, ?2, ?3)",
-                rusqlite::params![
-                    token_hash.as_str(),
-                    self.session.user.id.as_str(),
-                    expires_at.to_rfc3339(),
-                ],
-            )
-            .map_err(|e| VaultError::Database(format!("Failed to save refresh token: {e}")))?;
-        Ok(())
-    }
 }
+
+// ════════════════════════════════════════════════════════════════════
+// Tests
+// ════════════════════════════════════════════════════════════════════
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::crypto_operations::FakeCrypto;
-    use crate::types::{EntryPassword, Login, PlainEntry, ServiceName, ServiceUrl};
+    use crate::types::{EncryptionKey, EntryPassword, Login, ServiceName, ServiceUrl};
 
     fn open_test_db() -> DB<Open, FakeCrypto> {
         DB::<Closed, FakeCrypto>::new(FakeCrypto)
             .open(":memory:")
             .expect("Failed to open test database")
     }
+
     fn authenticated_test_db() -> DB<Authenticated, FakeCrypto> {
         let db = open_test_db();
 
@@ -427,12 +416,20 @@ mod tests {
         )
         .expect("Failed to create user");
 
-        db.authenticate(
-            Email::new("alex@icloud.com".to_string()),
-            MasterPassword::new("SuperSecret123!".to_string()),
-        )
-        .expect("Failed to authenticate")
+        let pass = db
+            .create_pass(
+                Email::new("alex@icloud.com".to_string()),
+                MasterPassword::new("SuperSecret123!".to_string()),
+            )
+            .expect("Failed to create pass");
+
+        db.enter(pass).expect("Failed to enter vault")
     }
+
+    // ════════════════════════════════════════════
+    // create_user
+    // ════════════════════════════════════════════
+
     #[test]
     fn test_open_database() {
         let db = open_test_db();
@@ -445,35 +442,178 @@ mod tests {
 
         assert_eq!(user.email.as_str(), "alex@icloud.com");
     }
-    #[test]
-    fn test_authenticate() {
-        let db = open_test_db();
 
-        // Сначала регистрируем
+    // ════════════════════════════════════════════
+    // create_pass
+    // ════════════════════════════════════════════
+
+    #[test]
+    fn create_pass_returns_vault_pass() {
+        let db = open_test_db();
         db.create_user(
             Email::new("alex@icloud.com".to_string()),
             MasterPassword::new("SuperSecret123!".to_string()),
         )
-        .expect("Failed to create user");
+        .unwrap();
 
-        // Потом логинимся — db потребляется, возвращается DB<Authenticated>
-        let db = db
-            .authenticate(
+        let pass = db
+            .create_pass(
                 Email::new("alex@icloud.com".to_string()),
                 MasterPassword::new("SuperSecret123!".to_string()),
             )
-            .expect("Failed to authenticate");
+            .unwrap();
 
-        // db теперь DB<Authenticated, FakeCrypto>
-        assert_eq!(db.session.user.email.as_str(), "alex@icloud.com");
+        assert_eq!(pass.email().as_str(), "alex@icloud.com");
+        assert!(!pass.user_id().as_str().is_empty());
+        assert!(!pass.encryption_key().as_str().is_empty());
     }
+
+    #[test]
+    fn create_pass_wrong_password_fails() {
+        let db = open_test_db();
+        db.create_user(
+            Email::new("alex@icloud.com".to_string()),
+            MasterPassword::new("CorrectPassword!".to_string()),
+        )
+        .unwrap();
+
+        let result = db.create_pass(
+            Email::new("alex@icloud.com".to_string()),
+            MasterPassword::new("WrongPassword!".to_string()),
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn create_pass_nonexistent_user_fails() {
+        let db = open_test_db();
+
+        let result = db.create_pass(
+            Email::new("nobody@example.com".to_string()),
+            MasterPassword::new("anything".to_string()),
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn create_pass_does_not_consume_db() {
+        let db = open_test_db();
+        db.create_user(
+            Email::new("alex@icloud.com".to_string()),
+            MasterPassword::new("SuperSecret123!".to_string()),
+        )
+        .unwrap();
+
+        // create_pass заимствует &self — db жив после вызова
+        let _pass = db
+            .create_pass(
+                Email::new("alex@icloud.com".to_string()),
+                MasterPassword::new("SuperSecret123!".to_string()),
+            )
+            .unwrap();
+
+        // db всё ещё доступен для enter()
+        let pass2 = db
+            .create_pass(
+                Email::new("alex@icloud.com".to_string()),
+                MasterPassword::new("SuperSecret123!".to_string()),
+            )
+            .unwrap();
+
+        let _db = db.enter(pass2).unwrap();
+    }
+
+    // ════════════════════════════════════════════
+    // enter
+    // ════════════════════════════════════════════
+
+    #[test]
+    fn enter_with_pass_from_create_pass() {
+        let db = open_test_db();
+        db.create_user(
+            Email::new("alex@icloud.com".to_string()),
+            MasterPassword::new("SuperSecret123!".to_string()),
+        )
+        .unwrap();
+
+        let pass = db
+            .create_pass(
+                Email::new("alex@icloud.com".to_string()),
+                MasterPassword::new("SuperSecret123!".to_string()),
+            )
+            .unwrap();
+
+        let db = db.enter(pass).unwrap();
+        assert_eq!(db.user_email().as_str(), "alex@icloud.com");
+    }
+
+    #[test]
+    fn enter_with_external_pass() {
+        // Симулируем VaultPass, пришедший от Вахтера (JWT decode)
+        let db = open_test_db();
+        let user = db
+            .create_user(
+                Email::new("alex@icloud.com".to_string()),
+                MasterPassword::new("SuperSecret123!".to_string()),
+            )
+            .unwrap();
+
+        let external_pass = VaultPass::new(
+            UserId::new(user.id.as_str().to_string()),
+            Email::new("alex@icloud.com".to_string()),
+            EncryptionKey::new("external-key-from-jwt".to_string()),
+        );
+
+        let db = db.enter(external_pass).unwrap();
+        assert_eq!(db.user_email().as_str(), "alex@icloud.com");
+        assert_eq!(db.encryption_key().as_str(), "external-key-from-jwt");
+    }
+
+    #[test]
+    fn enter_nonexistent_user_fails() {
+        let db = open_test_db();
+        let fake_pass = VaultPass::new(
+            UserId::new("nonexistent-user-id".to_string()),
+            Email::new("nobody@example.com".to_string()),
+            EncryptionKey::new("0".repeat(64)),
+        );
+
+        assert!(db.enter(fake_pass).is_err());
+    }
+
+    #[test]
+    fn enter_uses_db_email_not_pass_email() {
+        // enter() берёт email из БД (авторитетный источник),
+        // а не из VaultPass (который мог прийти из JWT claims)
+        let db = open_test_db();
+        let user = db
+            .create_user(
+                Email::new("real@icloud.com".to_string()),
+                MasterPassword::new("SuperSecret123!".to_string()),
+            )
+            .unwrap();
+
+        let pass_with_stale_email = VaultPass::new(
+            UserId::new(user.id.as_str().to_string()),
+            Email::new("stale@old-email.com".to_string()),
+            EncryptionKey::new("some-key".to_string()),
+        );
+
+        let db = db.enter(pass_with_stale_email).unwrap();
+        // Должен быть email из БД, а не из pass
+        assert_eq!(db.user_email().as_str(), "real@icloud.com");
+    }
+
+    // ════════════════════════════════════════════
+    // CRUD entries
+    // ════════════════════════════════════════════
+
     #[test]
     fn test_save_and_read_entry() {
         let db = authenticated_test_db();
-        // Создаём открытую запись
         let plain = PlainEntry {
             id: EntryId::new(Uuid::new_v4().to_string()),
-            user_id: UserId::new(db.session.user.id.as_str().to_string()),
+            user_id: UserId::new(db.user_id().as_str().to_string()),
             service_name: ServiceName::new("Hetzner Cloud".to_string()),
             service_url: ServiceUrl::new("https://console.hetzner.com".to_string()),
             login: Login::new("alex@icloud.com".to_string()),
@@ -482,14 +622,13 @@ mod tests {
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
-        // Шифруем и сохраняем
         let encrypted = db.encrypt(&plain).expect("Failed to encrypt");
         db.save_entry(&encrypted).expect("Failed to save entry");
-        // Читаем обратно
-        let user_id = UserId::new(db.session.user.id.as_str().to_string());
+
+        let user_id = UserId::new(db.user_id().as_str().to_string());
         let entries = db.list_entries(&user_id).expect("Failed to list entries");
         assert_eq!(entries.len(), 1);
-        // Расшифровываем и проверяем
+
         let decrypted = db.decrypt(&entries[0]).expect("Failed to decrypt");
         assert_eq!(decrypted.service_name.as_str(), "Hetzner Cloud");
         assert_eq!(
@@ -500,12 +639,13 @@ mod tests {
         assert_eq!(decrypted.password.as_str(), "Kx7$mR#2pL9&");
         assert_eq!(decrypted.notes, "VPS CX23 Helsinki");
     }
+
     #[test]
     fn test_delete_entry() {
         let db = authenticated_test_db();
         let plain = PlainEntry {
             id: EntryId::new(Uuid::new_v4().to_string()),
-            user_id: UserId::new(db.session.user.id.as_str().to_string()),
+            user_id: UserId::new(db.user_id().as_str().to_string()),
             service_name: ServiceName::new("Instagram".to_string()),
             service_url: ServiceUrl::new("https://instagram.com".to_string()),
             login: Login::new("nastya_gram".to_string()),
@@ -516,16 +656,18 @@ mod tests {
         };
         let encrypted = db.encrypt(&plain).expect("Failed to encrypt");
         db.save_entry(&encrypted).expect("Failed to save");
+
         let deleted = db.delete_entry(&encrypted.id).expect("Failed to delete");
         assert!(deleted);
-        let user_id = UserId::new(db.session.user.id.as_str().to_string());
+
+        let user_id = UserId::new(db.user_id().as_str().to_string());
         let entries = db.list_entries(&user_id).expect("Failed to list");
         assert_eq!(entries.len(), 0);
     }
+
     #[test]
     fn test_user_isolation() {
         let db = open_test_db();
-        // Регистрируем двух юзеров
         db.create_user(
             Email::new("alex@icloud.com".to_string()),
             MasterPassword::new("AlexPass123!".to_string()),
@@ -536,17 +678,19 @@ mod tests {
             MasterPassword::new("NastyaPass456!".to_string()),
         )
         .expect("Failed to create nastya");
-        // Логинимся как alex
-        let db = db
-            .authenticate(
+
+        let pass = db
+            .create_pass(
                 Email::new("alex@icloud.com".to_string()),
                 MasterPassword::new("AlexPass123!".to_string()),
             )
-            .expect("Failed to auth alex");
-        // Сохраняем запись alex
+            .expect("Failed to create pass");
+
+        let db = db.enter(pass).expect("Failed to enter");
+
         let plain = PlainEntry {
             id: EntryId::new(Uuid::new_v4().to_string()),
-            user_id: UserId::new(db.session.user.id.as_str().to_string()),
+            user_id: UserId::new(db.user_id().as_str().to_string()),
             service_name: ServiceName::new("Hetzner".to_string()),
             service_url: ServiceUrl::new("https://hetzner.com".to_string()),
             login: Login::new("alex_hetzner".to_string()),
@@ -557,107 +701,26 @@ mod tests {
         };
         let encrypted = db.encrypt(&plain).expect("Failed to encrypt");
         db.save_entry(&encrypted).expect("Failed to save");
-        // Проверяем: у alex одна запись
-        let alex_id = UserId::new(db.session.user.id.as_str().to_string());
+
+        let alex_id = UserId::new(db.user_id().as_str().to_string());
         let alex_entries = db.list_entries(&alex_id).expect("Failed to list");
         assert_eq!(alex_entries.len(), 1);
-        // Проверяем: у nastya ноль записей (даже через alex's DB)
+
         let nastya_fake_id = UserId::new("nastya-fake-id".to_string());
         let nastya_entries = db.list_entries(&nastya_fake_id).expect("Failed to list");
         assert_eq!(nastya_entries.len(), 0);
     }
-    #[test]
-    fn test_wrong_password() {
-        let db = open_test_db();
-        db.create_user(
-            Email::new("alex@icloud.com".to_string()),
-            MasterPassword::new("CorrectPassword!".to_string()),
-        )
-        .expect("Failed to create user");
-        let result = db.authenticate(
-            Email::new("alex@icloud.com".to_string()),
-            MasterPassword::new("WrongPassword!".to_string()),
-        );
-        assert!(result.is_err());
-    }
 
     // ════════════════════════════════════════════
-    // Refresh tokens
-    // ════════════════════════════════════════════
-
-    /// Вставить refresh token напрямую через SQL (для тестов verify на DB<Open>)
-    fn insert_refresh_token(
-        db: &DB<Open, FakeCrypto>,
-        token_hash: &str,
-        user_id: &str,
-        expires_at: chrono::DateTime<Utc>,
-    ) {
-        db.conn
-            .execute(
-                "INSERT INTO refresh_tokens (token_hash, user_id, expires_at) VALUES (?1, ?2, ?3)",
-                rusqlite::params![token_hash, user_id, expires_at.to_rfc3339()],
-            )
-            .unwrap();
-    }
-
-    #[test]
-    fn save_and_verify_refresh_token() {
-        let db = open_test_db();
-        db.create_user(
-            Email::new("alex@icloud.com".to_string()),
-            MasterPassword::new("SuperSecret123!".to_string()),
-        )
-        .unwrap();
-
-        let hash = RefreshTokenHash::new("abc123hash".to_string());
-        let expires_at = Utc::now() + chrono::Duration::hours(1);
-        insert_refresh_token(&db, "abc123hash", "user-1", expires_at);
-
-        let user_id = db.verify_and_delete_refresh_token(&hash).unwrap();
-        assert_eq!(user_id.as_str(), "user-1");
-    }
-
-    #[test]
-    fn verify_deletes_token() {
-        let db = open_test_db();
-        let hash = RefreshTokenHash::new("abc123hash".to_string());
-        let expires_at = Utc::now() + chrono::Duration::hours(1);
-        insert_refresh_token(&db, "abc123hash", "user-1", expires_at);
-
-        db.verify_and_delete_refresh_token(&hash).unwrap();
-
-        // Повторный вызов — токен уже удалён (rotation)
-        assert!(db.verify_and_delete_refresh_token(&hash).is_err());
-    }
-
-    #[test]
-    fn verify_expired_token_fails() {
-        let db = open_test_db();
-        let hash = RefreshTokenHash::new("expired-hash".to_string());
-        let expires_at = Utc::now() - chrono::Duration::hours(1); // в прошлом
-        insert_refresh_token(&db, "expired-hash", "user-1", expires_at);
-
-        assert!(db.verify_and_delete_refresh_token(&hash).is_err());
-    }
-
-    #[test]
-    fn verify_nonexistent_token_fails() {
-        let db = open_test_db();
-        let hash = RefreshTokenHash::new("does-not-exist".to_string());
-
-        assert!(db.verify_and_delete_refresh_token(&hash).is_err());
-    }
-
-    // ════════════════════════════════════════════
-    // restore_session
+    // Full flow: create_pass → enter (File-based DB)
     // ════════════════════════════════════════════
 
     #[test]
-    fn restore_session_works() {
-        let tmp = std::env::temp_dir().join("vault_test_restore.db");
-        let _ = std::fs::remove_file(&tmp); // clean slate
+    fn full_flow_create_pass_then_enter() {
+        let tmp = std::env::temp_dir().join("vault_test_full_flow.db");
+        let _ = std::fs::remove_file(&tmp);
 
-        // 1. Создаём юзера и аутентифицируемся
+        // 1. Регистрируем и получаем pass
         let db = DB::<Closed, FakeCrypto>::new(FakeCrypto)
             .open(tmp.to_str().unwrap())
             .unwrap();
@@ -666,33 +729,32 @@ mod tests {
             MasterPassword::new("SuperSecret123!".to_string()),
         )
         .unwrap();
-        let auth_db = db
-            .authenticate(
+
+        let pass = db
+            .create_pass(
                 Email::new("alex@icloud.com".to_string()),
                 MasterPassword::new("SuperSecret123!".to_string()),
             )
             .unwrap();
-        let user_id = UserId::new(auth_db.user_id().as_str().to_string());
-        let ek = types::EncryptionKey::new(auth_db.encryption_key().as_str().to_string());
-        drop(auth_db);
 
-        // 2. Новое соединение — restore_session без пароля
+        let user_id = UserId::new(pass.user_id().as_str().to_string());
+        let ek_str = pass.encryption_key().as_str().to_string();
+        let db = db.enter(pass).unwrap();
+        assert_eq!(db.user_email().as_str(), "alex@icloud.com");
+        drop(db);
+
+        // 2. Новое подключение — enter с внешним VaultPass (как от JWT)
         let db = DB::<Closed, FakeCrypto>::new(FakeCrypto)
             .open(tmp.to_str().unwrap())
             .unwrap();
-        let db = db.restore_session(user_id, ek).unwrap();
-
+        let external_pass = VaultPass::new(
+            user_id,
+            Email::new("alex@icloud.com".to_string()),
+            EncryptionKey::new(ek_str),
+        );
+        let db = db.enter(external_pass).unwrap();
         assert_eq!(db.user_email().as_str(), "alex@icloud.com");
 
         let _ = std::fs::remove_file(&tmp);
-    }
-
-    #[test]
-    fn restore_session_nonexistent_user_fails() {
-        let db = open_test_db();
-        let fake_id = UserId::new("nonexistent-user-id".to_string());
-        let fake_ek = types::EncryptionKey::new("0".repeat(64));
-
-        assert!(db.restore_session(fake_id, fake_ek).is_err());
     }
 }

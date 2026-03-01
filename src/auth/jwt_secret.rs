@@ -1,9 +1,20 @@
-use crate::types::JwtSecret;
+//! Загрузка / генерация JWT-секрета.
+//!
+//! Иерархия источников:
+//! 1. Переменная окружения `JWT_SECRET`
+//! 2. Файл `{db_dir}/.jwt_secret`
+//! 3. Генерация 64 random bytes → hex → сохранение в файл
+
+use super::JwtSecret;
 use rand::RngExt;
 use std::fs;
 use std::path::Path;
 use tracing::info;
 
+/// Загрузить или создать JWT-секрет.
+///
+/// `db_path` используется для определения директории,
+/// где хранить файл `.jwt_secret`.
 pub fn load_or_create_jwt_secret(db_path: &str) -> Result<JwtSecret, std::io::Error> {
     // 1. Проверяем переменную окружения
     if let Ok(secret) = std::env::var("JWT_SECRET") {
