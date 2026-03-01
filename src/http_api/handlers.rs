@@ -1,14 +1,13 @@
 use super::AppState;
-use super::extractors;
+use crate::auth;
+use crate::auth::{AuthStore, RefreshTokenHash, jwt_provider};
 use crate::crypto_operations::CryptoProvider;
-use crate::http_api::jwt;
-use crate::http_api::jwt::REFRESH_TOKEN_TTL_DAYS;
 use crate::password_generator::{Empty, PasswordGenerator};
-use crate::sqlite::{Closed, DB};
 use crate::types::{
-    Email, EntryId, EntryPassword, Login, MasterPassword, PlainEntry, RefreshTokenHash,
-    ServiceName, ServiceUrl, UserId,
+    Email, EncryptionKey, EntryId, EntryPassword, Login, MasterPassword, PlainEntry, ServiceName,
+    ServiceUrl, UserId,
 };
+use crate::vault::{Closed, DB};
 use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
@@ -16,19 +15,23 @@ use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
+
 // ════════════════════════════════════════════════════════════════════
 // Request / Response structs
 // ════════════════════════════════════════════════════════════════════
+
 #[derive(Deserialize)]
 pub struct RegisterRequest {
     email: String,
     master_password: String,
 }
+
 #[derive(Serialize)]
 pub struct RegisterResponse {
     user_id: String,
     message: String,
 }
+
 #[derive(Deserialize)]
 pub struct AddRequest {
     service_name: String,
@@ -37,17 +40,20 @@ pub struct AddRequest {
     password: String,
     notes: String,
 }
+
 #[derive(Serialize)]
 pub struct AddResponse {
     entry_id: String,
     message: String,
 }
+
 #[derive(Serialize)]
 pub struct ListEntry {
     entry_id: String,
     service_name: String,
     created_at: String,
 }
+
 #[derive(Serialize)]
 pub struct ViewResponse {
     entry_id: String,
@@ -59,10 +65,12 @@ pub struct ViewResponse {
     created_at: String,
     updated_at: String,
 }
+
 #[derive(Serialize)]
 pub struct DeleteResponse {
     message: String,
 }
+
 #[derive(Deserialize)]
 pub struct GenerateParams {
     #[serde(default = "default_length")]
@@ -76,73 +84,85 @@ pub struct GenerateParams {
     #[serde(default = "default_true")]
     symbols: bool,
 }
+
 fn default_length() -> usize {
     20
 }
+
 fn default_true() -> bool {
     true
 }
+
 #[derive(Serialize)]
 pub struct GenerateResponse {
     password: String,
 }
+
 #[derive(Deserialize)]
 pub struct LoginRequest {
     email: String,
     master_password: String,
 }
+
 #[derive(Serialize)]
 pub struct LoginResponse {
     access_token: String,
     refresh_token: String,
 }
+
 #[derive(Deserialize)]
 pub struct RefreshRequest {
     refresh_token: String,
     access_token: String,
 }
+
 // ════════════════════════════════════════════════════════════════════
 // Handlers
 // ════════════════════════════════════════════════════════════════════
+
 pub async fn health_handler() -> &'static str {
     "ok"
 }
+
 /// POST /login
+///
+/// Vault: create_pass(email, password) → VaultPass
+/// Auth:  JWT access_token + refresh_token → auth.db
 pub async fn login_handler<C: CryptoProvider + Clone + Send + Sync + 'static>(
     State(state): State<AppState<C>>,
     Json(body): Json<LoginRequest>,
 ) -> Result<Json<LoginResponse>, StatusCode> {
     let db_path = state.db_path.clone();
+    let auth_db_path = state.auth_db_path.clone();
     let jwt_secret = state.jwt_secret.clone();
     let crypto = state.crypto.clone();
 
     tokio::task::spawn_blocking(move || {
         let email = Email::parse(body.email).map_err(|_| StatusCode::BAD_REQUEST)?;
 
+        // 1. Vault: проверяем пароль → VaultPass
         let db = DB::<Closed, C>::new(crypto)
             .open(&db_path)
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-        let db = db
-            .authenticate(email, MasterPassword::new(body.master_password))
+        let pass = db
+            .create_pass(email, MasterPassword::new(body.master_password))
             .map_err(|_| StatusCode::UNAUTHORIZED)?;
 
-        // Access token с encryption_key внутри claims
-        let access_token = jwt::create_access_token(
-            db.user_id(),
-            db.user_email(),
-            db.encryption_key(),
-            &jwt_secret,
-        )
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        // 2. JWT: access token из VaultPass
+        let access_token = jwt_provider::create_access_token_from_pass(&pass, &jwt_secret)
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-        // Refresh token: UUID → SHA-256 hash → сохранить в БД
+        // 3. Auth store: refresh token → auth.db
         let refresh_token = Uuid::new_v4().to_string();
         let hash = hex::encode(Sha256::digest(refresh_token.as_bytes()));
         let token_hash = RefreshTokenHash::new(hash);
-        let expires_at = Utc::now() + chrono::Duration::days(REFRESH_TOKEN_TTL_DAYS);
+        let expires_at = Utc::now() + chrono::Duration::days(auth::REFRESH_TOKEN_TTL_DAYS);
 
-        db.save_refresh_token(&token_hash, expires_at)
+        let store =
+            AuthStore::open(&auth_db_path).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        store
+            .save_refresh_token(&token_hash, pass.user_id(), expires_at)
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
         Ok(Json(LoginResponse {
@@ -155,56 +175,55 @@ pub async fn login_handler<C: CryptoProvider + Clone + Send + Sync + 'static>(
 }
 
 /// POST /refresh
+///
+/// Только auth: JWT decode + auth.db (без vault.db).
+/// Refresh-токен не требует открытия Хранилища.
 pub async fn refresh_handler<C: CryptoProvider + Clone + Send + Sync + 'static>(
     State(state): State<AppState<C>>,
     Json(body): Json<RefreshRequest>,
 ) -> Result<Json<LoginResponse>, StatusCode> {
-    let db_path = state.db_path.clone();
+    let auth_db_path = state.auth_db_path.clone();
     let jwt_secret = state.jwt_secret.clone();
-    let crypto = state.crypto.clone();
 
     tokio::task::spawn_blocking(move || {
-        // 1. Декодируем истёкший access_token (подпись проверяется, exp — нет)
-        let claims = jwt::decode_access_token_allow_expired(&body.access_token, &jwt_secret)
-            .map_err(|_| StatusCode::UNAUTHORIZED)?;
+        // 1. Декодируем истёкший access_token (подпись ✓, exp — ✗)
+        let claims =
+            jwt_provider::decode_access_token_allow_expired(&body.access_token, &jwt_secret)
+                .map_err(|_| StatusCode::UNAUTHORIZED)?;
 
-        // 2. Проверяем refresh_token: hash → найти в БД → удалить (rotation)
+        // 2. Проверяем refresh_token в auth.db (rotation: verify + delete)
         let hash = hex::encode(Sha256::digest(body.refresh_token.as_bytes()));
         let token_hash = RefreshTokenHash::new(hash);
 
-        let db = DB::<Closed, C>::new(crypto)
-            .open(&db_path)
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        let store =
+            AuthStore::open(&auth_db_path).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-        let token_user_id = db
+        let token_user_id = store
             .verify_and_delete_refresh_token(&token_hash)
             .map_err(|_| StatusCode::UNAUTHORIZED)?;
 
-        // 3. Проверяем что user_id в токенах совпадает
+        // 3. user_id в refresh-токене должен совпадать с access-токеном
         if token_user_id.as_str() != claims.sub {
             return Err(StatusCode::UNAUTHORIZED);
         }
 
-        // 4. Новый access_token (ek берём из старого JWT)
-        let user_id = UserId::new(claims.sub);
-        let email = Email::new(claims.email);
-        let encryption_key = crate::types::EncryptionKey::new(claims.ek);
-
-        let access_token = jwt::create_access_token(&user_id, &email, &encryption_key, &jwt_secret)
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        // 4. Новый access_token (данные из старого JWT claims)
+        let access_token = jwt_provider::create_access_token(
+            &token_user_id,
+            &Email::new(claims.email),
+            &EncryptionKey::new(claims.ek),
+            &jwt_secret,
+        )
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
         // 5. Новый refresh_token (rotation)
         let new_refresh_token = Uuid::new_v4().to_string();
         let new_hash = hex::encode(Sha256::digest(new_refresh_token.as_bytes()));
         let new_token_hash = RefreshTokenHash::new(new_hash);
-        let expires_at = Utc::now() + chrono::Duration::days(REFRESH_TOKEN_TTL_DAYS);
+        let expires_at = Utc::now() + chrono::Duration::days(auth::REFRESH_TOKEN_TTL_DAYS);
 
-        // restore_session чтобы вызвать save_refresh_token на DB<Authenticated>
-        let db = db
-            .restore_session(UserId::new(user_id.as_str().to_string()), encryption_key)
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-
-        db.save_refresh_token(&new_token_hash, expires_at)
+        store
+            .save_refresh_token(&new_token_hash, &token_user_id, expires_at)
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
         Ok(Json(LoginResponse {
@@ -245,6 +264,8 @@ pub async fn register_handler<C: CryptoProvider + Clone + Send + Sync + 'static>
 }
 
 /// POST /add
+///
+/// Вахтер (guard) → Пропуск (VaultPass) → Хранилище (vault CRUD)
 pub async fn add_handler<C: CryptoProvider + Clone + Send + Sync + 'static>(
     State(state): State<AppState<C>>,
     headers: axum::http::HeaderMap,
@@ -255,16 +276,29 @@ pub async fn add_handler<C: CryptoProvider + Clone + Send + Sync + 'static>(
     let crypto = state.crypto.clone();
 
     tokio::task::spawn_blocking(move || {
-        let auth = extractors::authenticate(&headers, &jwt_secret, &db_path, crypto.clone())?;
+        // Вахтер: Bearer JWT (быстрый путь) или Basic Auth (fallback)
+        let crypto_for_verify = crypto.clone();
+        let db_path_for_verify = db_path.clone();
+        let pass = auth::guard(&headers, &jwt_secret, move |email_str, password| {
+            let email = Email::parse(email_str)
+                .map_err(|e| auth::AuthError::InvalidCredentials(format!("invalid email: {e}")))?;
+            let db = DB::<Closed, C>::new(crypto_for_verify)
+                .open(&db_path_for_verify)
+                .map_err(|e| auth::AuthError::InvalidCredentials(format!("db error: {e}")))?;
+            db.create_pass(email, password)
+                .map_err(|e| auth::AuthError::InvalidCredentials(e.to_string()))
+        })
+        .map_err(StatusCode::from)?;
 
+        // Хранилище: входим с пропуском
         let db = DB::<Closed, C>::new(crypto)
             .open(&db_path)
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-
         let db = db
-            .restore_session(auth.user_id, auth.encryption_key)
+            .enter(pass)
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
+        // CRUD: добавляем запись
         let now = Utc::now();
         let entry_id = Uuid::new_v4().to_string();
 
@@ -296,6 +330,8 @@ pub async fn add_handler<C: CryptoProvider + Clone + Send + Sync + 'static>(
 }
 
 /// GET /list
+///
+/// Вахтер (guard) → Пропуск → Хранилище (list_entries)
 pub async fn list_handler<C: CryptoProvider + Clone + Send + Sync + 'static>(
     State(state): State<AppState<C>>,
     headers: axum::http::HeaderMap,
@@ -305,14 +341,26 @@ pub async fn list_handler<C: CryptoProvider + Clone + Send + Sync + 'static>(
     let crypto = state.crypto.clone();
 
     tokio::task::spawn_blocking(move || {
-        let auth = extractors::authenticate(&headers, &jwt_secret, &db_path, crypto.clone())?;
+        // Вахтер
+        let crypto_for_verify = crypto.clone();
+        let db_path_for_verify = db_path.clone();
+        let pass = auth::guard(&headers, &jwt_secret, move |email_str, password| {
+            let email = Email::parse(email_str)
+                .map_err(|e| auth::AuthError::InvalidCredentials(format!("invalid email: {e}")))?;
+            let db = DB::<Closed, C>::new(crypto_for_verify)
+                .open(&db_path_for_verify)
+                .map_err(|e| auth::AuthError::InvalidCredentials(format!("db error: {e}")))?;
+            db.create_pass(email, password)
+                .map_err(|e| auth::AuthError::InvalidCredentials(e.to_string()))
+        })
+        .map_err(StatusCode::from)?;
 
+        // Хранилище
         let db = DB::<Closed, C>::new(crypto)
             .open(&db_path)
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-
         let db = db
-            .restore_session(auth.user_id, auth.encryption_key)
+            .enter(pass)
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
         let user_id = UserId::new(db.user_id().as_str().to_string());
@@ -339,6 +387,8 @@ pub async fn list_handler<C: CryptoProvider + Clone + Send + Sync + 'static>(
 }
 
 /// GET /view/{id}
+///
+/// Вахтер (guard) → Пропуск → Хранилище (decrypt entry)
 pub async fn view_handler<C: CryptoProvider + Clone + Send + Sync + 'static>(
     State(state): State<AppState<C>>,
     headers: axum::http::HeaderMap,
@@ -349,14 +399,26 @@ pub async fn view_handler<C: CryptoProvider + Clone + Send + Sync + 'static>(
     let crypto = state.crypto.clone();
 
     tokio::task::spawn_blocking(move || {
-        let auth = extractors::authenticate(&headers, &jwt_secret, &db_path, crypto.clone())?;
+        // Вахтер
+        let crypto_for_verify = crypto.clone();
+        let db_path_for_verify = db_path.clone();
+        let pass = auth::guard(&headers, &jwt_secret, move |email_str, password| {
+            let email = Email::parse(email_str)
+                .map_err(|e| auth::AuthError::InvalidCredentials(format!("invalid email: {e}")))?;
+            let db = DB::<Closed, C>::new(crypto_for_verify)
+                .open(&db_path_for_verify)
+                .map_err(|e| auth::AuthError::InvalidCredentials(format!("db error: {e}")))?;
+            db.create_pass(email, password)
+                .map_err(|e| auth::AuthError::InvalidCredentials(e.to_string()))
+        })
+        .map_err(StatusCode::from)?;
 
+        // Хранилище
         let db = DB::<Closed, C>::new(crypto)
             .open(&db_path)
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-
         let db = db
-            .restore_session(auth.user_id, auth.encryption_key)
+            .enter(pass)
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
         let user_id = UserId::new(db.user_id().as_str().to_string());
@@ -389,6 +451,8 @@ pub async fn view_handler<C: CryptoProvider + Clone + Send + Sync + 'static>(
 }
 
 /// DELETE /delete/{id}
+///
+/// Вахтер (guard) → Пропуск → Хранилище (delete_entry)
 pub async fn delete_handler<C: CryptoProvider + Clone + Send + Sync + 'static>(
     State(state): State<AppState<C>>,
     headers: axum::http::HeaderMap,
@@ -399,14 +463,26 @@ pub async fn delete_handler<C: CryptoProvider + Clone + Send + Sync + 'static>(
     let crypto = state.crypto.clone();
 
     tokio::task::spawn_blocking(move || {
-        let auth = extractors::authenticate(&headers, &jwt_secret, &db_path, crypto.clone())?;
+        // Вахтер
+        let crypto_for_verify = crypto.clone();
+        let db_path_for_verify = db_path.clone();
+        let pass = auth::guard(&headers, &jwt_secret, move |email_str, password| {
+            let email = Email::parse(email_str)
+                .map_err(|e| auth::AuthError::InvalidCredentials(format!("invalid email: {e}")))?;
+            let db = DB::<Closed, C>::new(crypto_for_verify)
+                .open(&db_path_for_verify)
+                .map_err(|e| auth::AuthError::InvalidCredentials(format!("db error: {e}")))?;
+            db.create_pass(email, password)
+                .map_err(|e| auth::AuthError::InvalidCredentials(e.to_string()))
+        })
+        .map_err(StatusCode::from)?;
 
+        // Хранилище
         let db = DB::<Closed, C>::new(crypto)
             .open(&db_path)
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-
         let db = db
-            .restore_session(auth.user_id, auth.encryption_key)
+            .enter(pass)
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
         let deleted = db
@@ -451,12 +527,16 @@ pub async fn generate_handler(
     }))
 }
 
+// ════════════════════════════════════════════════════════════════════
+// Tests
+// ════════════════════════════════════════════════════════════════════
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::auth::JwtSecret;
     use crate::crypto_operations::FakeCrypto;
     use crate::http_api::AppState;
-    use crate::types::JwtSecret;
     use axum::Router;
     use axum::body::Body;
     use axum::http::Request;
@@ -472,6 +552,7 @@ mod tests {
     struct TestApp {
         router: Router,
         db_path: String,
+        auth_db_path: String,
     }
 
     impl TestApp {
@@ -482,8 +563,11 @@ mod tests {
                 .unwrap()
                 .to_string();
 
+            let auth_db_path = auth::auth_db_path(&db_path);
+
             let state = AppState {
                 db_path: db_path.clone(),
+                auth_db_path: auth_db_path.clone(),
                 jwt_secret: Arc::new(JwtSecret::new("test-jwt-secret-for-handlers".to_string())),
                 crypto: FakeCrypto,
             };
@@ -500,7 +584,11 @@ mod tests {
                 .route("/generate", get(generate_handler))
                 .with_state(state);
 
-            Self { router, db_path }
+            Self {
+                router,
+                db_path,
+                auth_db_path,
+            }
         }
 
         async fn request(&self, req: Request<Body>) -> axum::http::Response<Body> {
@@ -511,6 +599,7 @@ mod tests {
     impl Drop for TestApp {
         fn drop(&mut self) {
             let _ = std::fs::remove_file(&self.db_path);
+            let _ = std::fs::remove_file(&self.auth_db_path);
         }
     }
 
