@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.1.4](https://github.com/AvdienkoSergey/vault-family/compare/vault-family-v0.1.3...vault-family-v0.1.4) (2026-03-01)
+
+
+### Features
+
+* add JWT access token creation and decoding ([1798b11](https://github.com/AvdienkoSergey/vault-family/commit/1798b111bf8e9f36547987fb2bf0e8ed7e6e9191))
+* **auth:** add extract_bearer_token and authenticate with JWT/Basic fallback ([ff2c861](https://github.com/AvdienkoSergey/vault-family/commit/ff2c861c6dec5c73eaa9beb3fdf8553fe68c25cd))
+* **auth:** add POST /refresh endpoint with token rotation ([53e80de](https://github.com/AvdienkoSergey/vault-family/commit/53e80de5bad35eb1024ff4dea0fc61719fbe9f57))
+* **jwt:** add jwt_secret loader with tracing and Result error handling ([2b58e68](https://github.com/AvdienkoSergey/vault-family/commit/2b58e6841a50deaf9cb89119b178e815d39e6964))
+* **jwt:** add POST /login endpoint with JWT and refresh tokens ([ddd05f8](https://github.com/AvdienkoSergey/vault-family/commit/ddd05f820ac820a6e99347ed2218f5a9322f1686))
+
 ## [0.1.3](https://github.com/AvdienkoSergey/vault-family/compare/vault-family-v0.1.2...vault-family-v0.1.3) (2026-02-28)
 
 
