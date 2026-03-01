@@ -11,6 +11,7 @@ use tracing_subscriber::EnvFilter;
 
 use std::sync::Arc;
 
+use crate::crypto_operations::{CryptoProvider, RealCrypto};
 use crate::types::JwtSecret;
 
 use handlers::{
@@ -42,9 +43,10 @@ impl std::fmt::Display for ServerError {
 // ════════════════════════════════════════════════════════════════════
 
 #[derive(Clone)]
-pub(crate) struct AppState {
+pub(crate) struct AppState<C: CryptoProvider + Clone> {
     pub(crate) db_path: String,
     pub(crate) jwt_secret: Arc<JwtSecret>,
+    pub(crate) crypto: C,
 }
 
 // ════════════════════════════════════════════════════════════════════
@@ -67,18 +69,19 @@ pub async fn run_server(host: &str, port: u16, db_path: String) -> Result<(), Se
         .init();
     let app: Router = Router::new()
         .route("/health", get(health_handler))
-        .route("/login", post(login_handler))
-        .route("/refresh", post(refresh_handler))
-        .route("/register", post(register_handler))
-        .route("/add", post(add_handler))
-        .route("/list", get(list_handler))
-        .route("/view/{id}", get(view_handler))
-        .route("/delete/{id}", delete(delete_handler))
+        .route("/login", post(login_handler::<RealCrypto>))
+        .route("/refresh", post(refresh_handler::<RealCrypto>))
+        .route("/register", post(register_handler::<RealCrypto>))
+        .route("/add", post(add_handler::<RealCrypto>))
+        .route("/list", get(list_handler::<RealCrypto>))
+        .route("/view/{id}", get(view_handler::<RealCrypto>))
+        .route("/delete/{id}", delete(delete_handler::<RealCrypto>))
         .route("/generate", get(generate_handler))
         .layer(TraceLayer::new_for_http())
         .with_state(AppState {
             db_path,
             jwt_secret: Arc::new(jwt_secret),
+            crypto: RealCrypto,
         });
 
     let listener = TcpListener::bind(socket_address)
