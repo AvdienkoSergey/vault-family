@@ -9,7 +9,7 @@ use tracing_subscriber::EnvFilter;
 use std::sync::Arc;
 
 use crate::auth;
-use crate::auth::JwtSecret;
+use crate::auth::{JwtSecret, SessionStore};
 use crate::crypto_operations::{CryptoProvider, RealCrypto};
 
 use handlers::{
@@ -48,6 +48,8 @@ pub(crate) struct AppState<C: CryptoProvider + Clone> {
     pub(crate) auth_db_path: String,
     /// JWT-секрет для подписи токенов
     pub(crate) jwt_secret: Arc<JwtSecret>,
+    /// Серверное хранилище сессий (EncryptionKey в памяти, не в JWT)
+    pub(crate) session_store: SessionStore,
     /// Криптопровайдер
     pub(crate) crypto: C,
 }
@@ -88,6 +90,7 @@ pub async fn run_server(host: &str, port: u16, db_path: String) -> Result<(), Se
             db_path,
             auth_db_path,
             jwt_secret: Arc::new(jwt_secret),
+            session_store: SessionStore::new(),
             crypto: RealCrypto,
         });
 

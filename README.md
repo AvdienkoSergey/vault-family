@@ -61,6 +61,7 @@ vault-family/
 │   ├── cli.rs                  # CLI интерфейс (clap)
 │   ├── auth/                   # Guard — аутентификация и сессии
 │   │   ├── mod.rs              #   guard() — единая точка входа, AuthError
+│   │   ├── session_store.rs    #   SessionStore — EncryptionKey в памяти сервера
 │   │   ├── jwt_provider.rs     #   JWT Claims, create/decode access tokens
 │   │   ├── jwt_secret.rs       #   Загрузка/генерация JWT secret
 │   │   ├── jwt_store.rs        #   AuthStore — refresh_tokens в auth.db
@@ -87,6 +88,7 @@ vault-family/
 ```
 
 `vault.db` не знает про JWT и refresh-токены. `auth.db` не знает про записи и шифрование.
+EncryptionKey живёт только в `SessionStore` (оперативная память сервера) — не в БД и не в JWT.
 
 ### Branded Types
 
@@ -148,7 +150,8 @@ auth.db — TABLE refresh_tokens
 
 JWT / Сессии (auth/)
 ├── JwtSecret           branded_secret     ключ подписи HMAC-SHA256  [auth/jwt_types.rs]
-└── RefreshTokenHash    branded_secret     SHA-256 хэш в auth.db    [auth/jwt_types.rs]
+├── RefreshTokenHash    branded_secret     SHA-256 хэш в auth.db    [auth/jwt_types.rs]
+└── SessionStore        Arc<RwLock<HashMap>>  EncryptionKey в памяти сервера  [auth/session_store.rs]
 
 VaultPass — Пропуск (types.rs)
 ├── user_id             UserId
@@ -275,7 +278,8 @@ vault_db.create_pass(email, password)     ← vault.db: verify password, derive 
   ▼
 VaultPass { user_id, email, encryption_key }
   │
-  ├─► jwt::create_access_token(pass)      ← подписать JWT с claims
+  ├─► session_store.insert(user_id, ek)   ← ek в память сервера (TTL = 7 дней)
+  ├─► jwt::create_access_token(user_id, email)  ← JWT без ek
   ├─► auth_store.save_refresh_token(...)   ← auth.db: сохранить hash
   │
   ▼
@@ -288,7 +292,9 @@ Response { access_token, refresh_token }
 Request + "Authorization: Bearer {jwt}"
   │
   ▼
-auth::guard(headers, jwt_secret)          ← decode JWT, без БД
+auth::guard(headers, jwt_secret, session_store, verify)
+  │  JWT path: decode JWT → session_store.get(sub) → ek
+  │  Basic path: verify(email, pw) → session_store.insert(user_id, ek)
   │
   ▼
 VaultPass { user_id, email, encryption_key }
@@ -308,20 +314,20 @@ Response [{ entry_id, service_name }]
 ```
 Request { old_access_token, refresh_token }
   │
-  ├─► jwt::decode_allow_expired(old_token) → old claims
+  ├─► jwt::decode_allow_expired(old_token) → Claims { sub, email }
   ├─► auth_store.verify_and_delete(hash)   ← auth.db: rotation
+  ├─► session_store.get(sub) → ek          ← достать ek из памяти
   │
   ▼
-VaultPass::from_claims(old_claims)         ← пересоздать из claims
-  │
-  ├─► jwt::create_access_token(pass)       ← новый JWT
+  ├─► session_store.insert(sub, ek)        ← продлить TTL
+  ├─► jwt::create_access_token(sub, email) ← новый JWT (без ek)
   ├─► auth_store.save_refresh_token(...)   ← auth.db: новый hash
   │
   ▼
 Response { new_access_token, new_refresh_token }
 ```
 
-Заметь: refresh_handler вообще не открывает vault.db! Он работает только с auth.db и JWT.
+Заметь: refresh_handler не открывает vault.db! Он работает с auth.db, JWT и SessionStore.
 
 ### CLI (прямой путь, без Guard)
 
@@ -400,20 +406,39 @@ POST /refresh  →  новая пара {access_token, refresh_token}
 #### guard() — единая точка входа
 
 ```rust
-auth::guard(&headers, &jwt_secret, |email, password| {
+auth::guard(&headers, &jwt_secret, &session_store, |email, password| {
     vault_db.create_pass(email, password)
 })
 ```
 
-`guard()` пробует Bearer JWT (быстрый путь, без БД), при неудаче — извлекает Basic Auth credentials и вызывает `verify` callback. Closure-based DI: auth/ не зависит от vault/ напрямую.
+`guard()` пробует Bearer JWT (быстрый путь: decode JWT → `session_store.get(sub)` → ek), при неудаче — извлекает Basic Auth credentials и вызывает `verify` callback. При Basic Auth кэширует ek в SessionStore для будущих JWT-запросов. Closure-based DI: auth/ не зависит от vault/ напрямую.
 
 #### JWT Claims (access_token)
 
 ```
-{ sub: "user-uuid", email: "...", ek: "hex-encryption-key", exp: unix_timestamp }
+{ sub: "user-uuid", email: "...", exp: unix_timestamp }
 ```
 
-`ek` (encryption_key) передаётся внутри JWT payload — сервер не хранит ключ шифрования между запросами. Zero-knowledge принцип сохранён: сервер извлекает `ek` из JWT, использует для шифрования/расшифровки, дропает.
+JWT содержит только идентификацию — **без секретов**. EncryptionKey хранится в `SessionStore` (серверная память), не путешествует по сети.
+
+#### SessionStore — серверное хранилище сессий
+
+```
+SessionStore: Arc<RwLock<HashMap<String, SessionEntry>>>
+
+SessionEntry {
+    encryption_key_hex: Zeroizing<String>,   ← зануляется при удалении
+    expires_at: DateTime<Utc>,               ← TTL = 7 дней (refresh_token)
+}
+```
+
+**Почему TTL = 7 дней, а не 15 минут (как access_token)?**
+POST /refresh вызывается **после** истечения access_token. Если запись в SessionStore живёт 15 мин — к моменту refresh она уже удалена, ek не найти, refresh сломан. 7 дней — время жизни refresh_token. Пока можно обновить токен, ek должен быть доступен.
+
+**Ограничения:**
+- In-memory: при перезапуске сервера все сессии теряются (пользователи перелогиниваются)
+- Один процесс: HashMap не шарится между инстансами (горизонтальное масштабирование → Redis)
+- 1–5 пользователей: cleanup O(n) при каждом insert — незаметно
 
 #### JWT Secret
 
@@ -430,11 +455,13 @@ auth::guard(&headers, &jwt_secret, |email, password| {
 ```
 Клиент → POST /refresh {refresh_token, access_token}
 Сервер:
-  1. Декодирует access_token БЕЗ проверки exp (подпись проверяется)
+  1. Декодирует access_token БЕЗ проверки exp (подпись проверяется) → { sub, email }
   2. SHA-256(refresh_token) → ищет в auth.db
   3. Удаляет использованный refresh_token (rotation)
-  4. Создаёт новую пару access + refresh
-  5. Возвращает клиенту
+  4. session_store.get(sub) → ek (или 401 если сервер перезапустился)
+  5. session_store.insert(sub, ek) → продлить TTL
+  6. Создаёт новую пару access + refresh (JWT без ek)
+  7. Возвращает клиенту
 ```
 
 Rotation защищает от кражи: если атакующий использует украденный refresh_token, легитимный пользователь получит ошибку при следующем refresh.
@@ -501,11 +528,54 @@ curl "http://127.0.0.1:3000/generate?length=32&symbols=false"
 - **Отдельные БД** — vault.db (users + entries), auth.db (refresh_tokens), .jwt_secret
 - **JWT-сессии** — master_password передаётся только при `/login`; все последующие запросы используют краткосрочный access_token (15 мин)
 - **Bearer + Basic fallback** — PWA использует JWT, CLI может использовать Basic Auth для обратной совместимости
-- **Zero-knowledge** — encryption_key передаётся внутри JWT payload, сервер не хранит его между запросами
+- **Server-side session store** — EncryptionKey хранится в памяти сервера (`SessionStore`), не в JWT payload. JWT содержит только идентификацию (`sub` + `email`). Перехват токена не даёт ключ шифрования
 - **Refresh rotation** — каждый `/refresh` инвалидирует старый токен, защищая от кражи
 - **spawn_blocking** — все DB-операции в blocking closure, т.к. `rusqlite::Connection` не реализует `Send`
 - **Typestate сохранён** — каждый запрос проходит lifecycle: `DB<Closed> → DB<Open> → enter(VaultPass) → DB<Authenticated> → drop`
 - **Tracing** — `tower_http::TraceLayer` логирует метод, путь, статус и latency каждого запроса
+
+### Проверка корректности SessionStore
+
+```bash
+# 1. Login → Bearer request (ek из SessionStore)
+TOKEN=$(curl -s -X POST http://127.0.0.1:3000/login \
+  -H "Content-Type: application/json" \
+  -d '{"email":"user@example.com","master_password":"Secret123!"}' \
+  | jq -r '.access_token')
+
+curl -H "Authorization: Bearer $TOKEN" http://127.0.0.1:3000/list
+# → 200 OK, список записей (ek достан из SessionStore)
+
+# 2. Bearer без session entry → 401 (SessionExpired)
+# Перезапустить сервер, затем:
+curl -H "Authorization: Bearer $TOKEN" http://127.0.0.1:3000/list
+# → 401 Unauthorized (JWT валиден, но SessionStore пуст — сервер перезапустился)
+
+# 3. Basic Auth → Bearer request (basic кэширует ek, JWT его читает)
+curl -u "user@example.com:Secret123!" http://127.0.0.1:3000/list
+# → 200 OK + ek закэширован в SessionStore
+curl -H "Authorization: Bearer $TOKEN" http://127.0.0.1:3000/list
+# → 200 OK (после re-login ek снова в SessionStore)
+
+# 4. Refresh → Bearer request (ek переживает refresh)
+REFRESH=$(curl -s -X POST http://127.0.0.1:3000/login \
+  -H "Content-Type: application/json" \
+  -d '{"email":"user@example.com","master_password":"Secret123!"}' \
+  | jq -r '.refresh_token')
+
+# Дождаться истечения access_token (15 мин) или использовать старый:
+NEW_TOKEN=$(curl -s -X POST http://127.0.0.1:3000/refresh \
+  -H "Content-Type: application/json" \
+  -d "{\"refresh_token\":\"$REFRESH\",\"access_token\":\"$TOKEN\"}" \
+  | jq -r '.access_token')
+
+curl -H "Authorization: Bearer $NEW_TOKEN" http://127.0.0.1:3000/list
+# → 200 OK (ek по-прежнему в SessionStore, TTL продлён)
+
+# 5. JWT payload не содержит ek
+echo $TOKEN | cut -d. -f2 | base64 -d 2>/dev/null
+# → {"sub":"...","email":"...","exp":...}  ← нет поля "ek"
+```
 
 ## Typestate: DB
 
@@ -525,8 +595,8 @@ DB<Closed>  →  DB<Open>  →  DB<Authenticated>
 
 Два пути в `Authenticated`:
 - **CLI:** `create_pass(email, password)` → `VaultPass` → `enter(pass)` — проверяет PBKDF2, деривирует encryption_key, возвращает VaultPass. Заимствует `&self` (не потребляет DB).
-- **HTTP (JWT):** `auth::guard(headers, jwt_secret)` → `VaultPass` (из JWT claims, без БД) → `enter(pass)` — проверяет существование пользователя в vault.db.
-- **HTTP (Basic):** `auth::guard(headers, jwt_secret, |email, pw| db.create_pass(email, pw))` → `VaultPass` → `enter(pass)` — fallback через closure.
+- **HTTP (JWT):** `auth::guard(headers, jwt_secret, session_store, ...)` → decode JWT → `session_store.get(sub)` → `VaultPass` → `enter(pass)`
+- **HTTP (Basic):** `auth::guard(headers, jwt_secret, session_store, |email, pw| db.create_pass(email, pw))` → `VaultPass` + кэширует ek в SessionStore → `enter(pass)`
 
 `create_pass(&self)` **заимствует** DB, `enter(self)` **потребляет** DB (move semantics). Это позволяет создать VaultPass и затем войти в хранилище двумя отдельными шагами.
 
@@ -576,6 +646,7 @@ PasswordGenerator<Empty, N>  →  PasswordGenerator<Ready, N>
  ✅ 10. VaultPass — единый контракт между auth/ и vault/
  ✅ 11. Email валидация по RFC 5321/5322 (email_address crate)
  ✅ 12. auth/ и vault/ не зависят друг от друга (dependency inversion через closure)
+ ✅ 13. EncryptionKey не в JWT — хранится в SessionStore (Zeroizing, серверная память)
 ```
 
 ## Крипто-операции
@@ -615,7 +686,7 @@ decrypt_entry(&EncryptedEntry, &EncryptionKey) → PlainEntry
 
 ## Тесты
 
-98 unit-тестов покрывают все модули:
+105 unit-тестов покрывают все модули:
 
 ```
 cargo test
@@ -630,8 +701,9 @@ types::tests                              (8 тестов)  — Email::parse() +
 ├── vault_pass_into_parts
 └── vault_pass_debug_hides_secrets
 
-auth::tests                               (6 тестов)  — guard() единая точка входа
+auth::tests                               (7 тестов)  — guard() единая точка входа
 ├── guard_jwt_valid_token
+├── guard_jwt_without_session_returns_session_expired
 ├── guard_jwt_invalid_token
 ├── guard_basic_auth_calls_verify
 ├── guard_basic_auth_verify_fails
@@ -644,10 +716,9 @@ auth::basic_provider::tests               (4 теста)   — Basic Auth extrac
 ├── extract_basic_no_colon_fails
 └── extract_basic_bearer_header_fails
 
-auth::jwt_provider::tests                 (7 тестов)  — JWT encode/decode
+auth::jwt_provider::tests                 (6 тестов)  — JWT encode/decode
 ├── create_and_decode_roundtrip
 ├── create_from_pass_roundtrip
-├── claims_to_pass_preserves_data
 ├── decode_rejects_wrong_secret
 ├── decode_rejects_expired_token
 ├── decode_allow_expired_accepts_expired
@@ -658,6 +729,15 @@ auth::jwt_store::tests                    (4 теста)   — AuthStore (auth.d
 ├── verify_deletes_token_rotation
 ├── verify_expired_token_fails
 └── verify_nonexistent_token_fails
+
+auth::session_store::tests               (7 тестов)  — SessionStore (серверная память)
+├── insert_and_get
+├── get_nonexistent_returns_none
+├── insert_overwrites
+├── remove_deletes_entry
+├── expired_entry_returns_none
+├── cleanup_removes_expired_on_insert
+└── clone_shares_state
 
 vault::tests                              (13 тестов) — DB typestate + VaultPass
 ├── test_open_database
@@ -796,11 +876,11 @@ style: описание     → без bump
 - [x] HTTP API (axum): 9 endpoints, spawn_blocking, tracing
 - [x] JWT-сессии: access_token (15 мин) + refresh_token (7 дней) с rotation
 - [x] Bearer + Basic Auth fallback (CLI-совместимость)
-- [x] Zero-knowledge: encryption_key в JWT payload, сервер не хранит между запросами
+- [x] Server-side SessionStore: encryption_key в памяти сервера, не в JWT payload
 - [x] JWT Secret: env var → файл → автогенерация
 - [x] Архитектура Guard → Pass → Storage (auth/ и vault/ развязаны через VaultPass)
 - [x] Отдельные БД: vault.db (users + entries), auth.db (refresh_tokens)
-- [x] Unit-тесты (98 тестов: types, auth, vault, crypto, password_generator, handlers)
+- [x] Unit-тесты (105 тестов: types, auth, session_store, vault, crypto, password_generator, handlers)
 - [ ] PWA фронтенд с E2E шифрованием в браузере
 - [ ] Деплой на Hetzner CX23 Helsinki
 - [ ] Браузерное расширение с автозаполнением

@@ -11,6 +11,7 @@ pub mod jwt_provider;
 pub mod jwt_secret;
 pub mod jwt_store;
 mod jwt_types;
+pub mod session_store;
 
 use crate::types::{EncryptionKey, MasterPassword, UserId, VaultPass};
 use axum::http::StatusCode;
@@ -20,6 +21,7 @@ pub use basic_provider::Credentials;
 pub use jwt_provider::{Claims, JwtError, REFRESH_TOKEN_TTL_DAYS};
 pub use jwt_store::{AuthStore, StoreError};
 pub use jwt_types::{JwtSecret, RefreshTokenHash};
+pub use session_store::SessionStore;
 
 // ════════════════════════════════════════════════════════════════════
 // AuthError
@@ -33,6 +35,8 @@ pub enum AuthError {
     InvalidToken(String),
     /// Неверные credentials (пароль, email)
     InvalidCredentials(String),
+    /// EncryptionKey не найден в SessionStore (сервер перезапустился или сессия истекла)
+    SessionExpired,
     /// Ошибка хранилища refresh-токенов
     Store(StoreError),
 }
@@ -45,6 +49,7 @@ impl std::fmt::Display for AuthError {
             AuthError::MissingAuth => write!(f, "no authentication provided"),
             AuthError::InvalidToken(msg) => write!(f, "invalid token: {msg}"),
             AuthError::InvalidCredentials(msg) => write!(f, "invalid credentials: {msg}"),
+            AuthError::SessionExpired => write!(f, "session expired, please re-login"),
             AuthError::Store(e) => write!(f, "auth store error: {e}"),
         }
     }
@@ -69,6 +74,7 @@ impl From<AuthError> for StatusCode {
             AuthError::MissingAuth => StatusCode::UNAUTHORIZED,
             AuthError::InvalidToken(_) => StatusCode::UNAUTHORIZED,
             AuthError::InvalidCredentials(_) => StatusCode::UNAUTHORIZED,
+            AuthError::SessionExpired => StatusCode::UNAUTHORIZED,
             AuthError::Store(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
@@ -89,7 +95,7 @@ fn extract_bearer_token(headers: &axum::http::HeaderMap) -> Option<String> {
 
 /// Единая точка аутентификации — Вахтер.
 ///
-/// Пробует Bearer JWT (быстрый путь, без БД),
+/// Пробует Bearer JWT (быстрый путь, ek из SessionStore),
 /// при неудаче — извлекает Basic Auth credentials
 /// и вызывает `verify` callback для проверки пароля.
 ///
@@ -100,40 +106,53 @@ fn extract_bearer_token(headers: &axum::http::HeaderMap) -> Option<String> {
 ///
 /// ```ignore
 /// // В HTTP handler:
-/// let pass = auth::guard(&headers, &jwt_secret, |email, password| {
+/// let pass = auth::guard(&headers, &jwt_secret, &session_store, |email, password| {
 ///     let db = vault_db.open(&db_path)?;
 ///     db.create_pass(email, password)
 ///         .map_err(|e| AuthError::InvalidCredentials(e.to_string()))
 /// })?;
 ///
 /// // JWT-only (без fallback):
-/// let pass = auth::guard(&headers, &jwt_secret, |_, _| {
+/// let pass = auth::guard(&headers, &jwt_secret, &session_store, |_, _| {
 ///     Err(AuthError::MissingAuth)
 /// })?;
 /// ```
 pub fn guard<F>(
     headers: &axum::http::HeaderMap,
     jwt_secret: &JwtSecret,
+    session_store: &SessionStore,
     verify: F,
 ) -> Result<VaultPass, AuthError>
 where
     F: FnOnce(String, MasterPassword) -> Result<VaultPass, AuthError>,
 {
-    // 1. Bearer JWT — быстрый путь, без обращения к БД
+    // 1. Bearer JWT — быстрый путь, ek из серверной памяти
     if let Some(token) = extract_bearer_token(headers) {
         let claims = jwt_provider::decode_access_token(&token, jwt_secret)?;
+
+        let ek = session_store
+            .get(&claims.sub)
+            .ok_or(AuthError::SessionExpired)?;
 
         return Ok(VaultPass::new(
             UserId::new(claims.sub),
             crate::types::Email::new(claims.email),
-            EncryptionKey::new(claims.ek),
+            ek,
         ));
     }
 
     // 2. Basic Auth — fallback, делегируем проверку пароля вызывающему
     let creds = basic_provider::extract_basic_auth(headers).map_err(|_| AuthError::MissingAuth)?;
 
-    verify(creds.email, creds.master_password)
+    let pass = verify(creds.email, creds.master_password)?;
+
+    // Кэшируем ek для будущих JWT-запросов
+    session_store.insert(
+        pass.user_id().as_str(),
+        &EncryptionKey::new(pass.encryption_key().as_str().to_string()),
+    );
+
+    Ok(pass)
 }
 
 // ════════════════════════════════════════════════════════════════════
@@ -192,10 +211,14 @@ mod tests {
     #[test]
     fn guard_jwt_valid_token() {
         let secret = test_secret();
+        let store = SessionStore::new();
+
+        // Вставляем ek в session store ДО вызова guard
+        store.insert("user-1", &EncryptionKey::new("deadbeef".to_string()));
+
         let token = jwt_provider::create_access_token(
             &UserId::new("user-1".to_string()),
             &Email::new("alex@icloud.com".to_string()),
-            &EncryptionKey::new("deadbeef".to_string()),
             &secret,
         )
         .unwrap();
@@ -205,7 +228,7 @@ mod tests {
             panic!("verify should not be called for JWT path");
         };
 
-        let pass = guard(&headers, &secret, unreachable_verify).unwrap();
+        let pass = guard(&headers, &secret, &store, unreachable_verify).unwrap();
 
         assert_eq!(pass.user_id().as_str(), "user-1");
         assert_eq!(pass.email().as_str(), "alex@icloud.com");
@@ -213,14 +236,36 @@ mod tests {
     }
 
     #[test]
+    fn guard_jwt_without_session_returns_session_expired() {
+        let secret = test_secret();
+        let store = SessionStore::new(); // пустой — нет записи
+
+        let token = jwt_provider::create_access_token(
+            &UserId::new("user-1".to_string()),
+            &Email::new("alex@icloud.com".to_string()),
+            &secret,
+        )
+        .unwrap();
+
+        let headers = make_bearer_headers(&token);
+        let unreachable_verify = |_: String, _: MasterPassword| -> Result<VaultPass, AuthError> {
+            panic!("verify should not be called for JWT path");
+        };
+
+        let result = guard(&headers, &secret, &store, unreachable_verify);
+        assert!(matches!(result, Err(AuthError::SessionExpired)));
+    }
+
+    #[test]
     fn guard_jwt_invalid_token() {
         let secret = test_secret();
+        let store = SessionStore::new();
         let headers = make_bearer_headers("not-a-valid-jwt");
         let unreachable_verify = |_: String, _: MasterPassword| -> Result<VaultPass, AuthError> {
             panic!("verify should not be called for invalid JWT");
         };
 
-        let result = guard(&headers, &secret, unreachable_verify);
+        let result = guard(&headers, &secret, &store, unreachable_verify);
         assert!(result.is_err());
     }
 
@@ -231,6 +276,7 @@ mod tests {
     #[test]
     fn guard_basic_auth_calls_verify() {
         let secret = test_secret();
+        let store = SessionStore::new();
         let headers = make_basic_headers("alex@icloud.com", "SuperSecret123!");
 
         let verify = |email: String, password: MasterPassword| -> Result<VaultPass, AuthError> {
@@ -243,21 +289,26 @@ mod tests {
             ))
         };
 
-        let pass = guard(&headers, &secret, verify).unwrap();
+        let pass = guard(&headers, &secret, &store, verify).unwrap();
 
         assert_eq!(pass.user_id().as_str(), "user-42");
+
+        // Basic Auth кэширует ek в session store
+        let cached_ek = store.get("user-42").unwrap();
+        assert_eq!(cached_ek.as_str(), "derived-key");
     }
 
     #[test]
     fn guard_basic_auth_verify_fails() {
         let secret = test_secret();
+        let store = SessionStore::new();
         let headers = make_basic_headers("alex@icloud.com", "WrongPassword!");
 
         let verify = |_: String, _: MasterPassword| -> Result<VaultPass, AuthError> {
             Err(AuthError::InvalidCredentials("wrong password".to_string()))
         };
 
-        let result = guard(&headers, &secret, verify);
+        let result = guard(&headers, &secret, &store, verify);
         assert!(matches!(result, Err(AuthError::InvalidCredentials(_))));
     }
 
@@ -268,12 +319,13 @@ mod tests {
     #[test]
     fn guard_no_auth_header() {
         let secret = test_secret();
+        let store = SessionStore::new();
         let headers = HeaderMap::new();
         let unreachable_verify = |_: String, _: MasterPassword| -> Result<VaultPass, AuthError> {
             panic!("verify should not be called with no headers");
         };
 
-        let result = guard(&headers, &secret, unreachable_verify);
+        let result = guard(&headers, &secret, &store, unreachable_verify);
         assert!(matches!(result, Err(AuthError::MissingAuth)));
     }
 
