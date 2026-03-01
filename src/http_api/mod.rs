@@ -9,7 +9,7 @@ use tracing_subscriber::EnvFilter;
 use std::sync::Arc;
 
 use crate::auth;
-use crate::auth::{JwtSecret, SessionStore};
+use crate::auth::{FailedLoginTracker, JwtSecret, SessionStore};
 use crate::crypto_operations::{CryptoProvider, RealCrypto};
 
 use handlers::{
@@ -50,6 +50,8 @@ pub(crate) struct AppState<C: CryptoProvider + Clone> {
     pub(crate) jwt_secret: Arc<JwtSecret>,
     /// Серверное хранилище сессий (EncryptionKey в памяти, не в JWT)
     pub(crate) session_store: SessionStore,
+    /// Трекер неудачных попыток входа (brute-force защита)
+    pub(crate) failed_login_tracker: FailedLoginTracker,
     /// Криптопровайдер
     pub(crate) crypto: C,
 }
@@ -92,6 +94,7 @@ pub async fn run_server(host: &str, port: u16, db_path: String) -> Result<(), Se
             auth_db_path,
             jwt_secret: Arc::new(jwt_secret),
             session_store: SessionStore::new(),
+            failed_login_tracker: FailedLoginTracker::new(),
             crypto: RealCrypto,
         });
 

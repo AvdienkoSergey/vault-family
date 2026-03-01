@@ -142,10 +142,17 @@ pub async fn login_handler<C: CryptoProvider + Clone + Send + Sync + 'static>(
     let auth_db_path = state.auth_db_path.clone();
     let jwt_secret = state.jwt_secret.clone();
     let session_store = state.session_store.clone();
+    let failed_login_tracker = state.failed_login_tracker.clone();
     let crypto = state.crypto.clone();
 
     tokio::task::spawn_blocking(move || {
+        let email_str = body.email.clone();
         let email = Email::parse(body.email).map_err(|_| StatusCode::BAD_REQUEST)?;
+
+        // 0. Brute-force: проверяем блокировку ДО проверки пароля
+        if failed_login_tracker.is_locked(&email_str) {
+            return Err(StatusCode::FORBIDDEN);
+        }
 
         // 1. Vault: проверяем пароль → VaultPass
         let db = DB::<Closed, C>::new(crypto)
@@ -154,7 +161,11 @@ pub async fn login_handler<C: CryptoProvider + Clone + Send + Sync + 'static>(
 
         let pass = db
             .create_pass(email, MasterPassword::new(body.master_password))
-            .map_err(|_| StatusCode::UNAUTHORIZED)?;
+            .map_err(|_| {
+                // Фиксируем неудачную попытку
+                failed_login_tracker.record_failed_attempt(&email_str);
+                StatusCode::UNAUTHORIZED
+            })?;
 
         // 2. SessionStore: сохраняем ek в памяти сервера
         session_store.insert(
@@ -270,6 +281,7 @@ pub async fn logout_handler<C: CryptoProvider + Clone + Send + Sync + 'static>(
     let auth_db_path = state.auth_db_path.clone();
     let jwt_secret = state.jwt_secret.clone();
     let session_store = state.session_store.clone();
+    let failed_login_tracker = state.failed_login_tracker.clone();
     let crypto = state.crypto.clone();
 
     tokio::task::spawn_blocking(move || {
@@ -280,6 +292,7 @@ pub async fn logout_handler<C: CryptoProvider + Clone + Send + Sync + 'static>(
             &headers,
             &jwt_secret,
             &session_store,
+            &failed_login_tracker,
             move |email_str, password| {
                 let email = Email::parse(email_str).map_err(|e| {
                     auth::AuthError::InvalidCredentials(format!("invalid email: {e}"))
@@ -350,6 +363,7 @@ pub async fn add_handler<C: CryptoProvider + Clone + Send + Sync + 'static>(
     let db_path = state.db_path.clone();
     let jwt_secret = state.jwt_secret.clone();
     let session_store = state.session_store.clone();
+    let failed_login_tracker = state.failed_login_tracker.clone();
     let crypto = state.crypto.clone();
 
     tokio::task::spawn_blocking(move || {
@@ -360,6 +374,7 @@ pub async fn add_handler<C: CryptoProvider + Clone + Send + Sync + 'static>(
             &headers,
             &jwt_secret,
             &session_store,
+            &failed_login_tracker,
             move |email_str, password| {
                 let email = Email::parse(email_str).map_err(|e| {
                     auth::AuthError::InvalidCredentials(format!("invalid email: {e}"))
@@ -422,6 +437,7 @@ pub async fn list_handler<C: CryptoProvider + Clone + Send + Sync + 'static>(
     let db_path = state.db_path.clone();
     let jwt_secret = state.jwt_secret.clone();
     let session_store = state.session_store.clone();
+    let failed_login_tracker = state.failed_login_tracker.clone();
     let crypto = state.crypto.clone();
 
     tokio::task::spawn_blocking(move || {
@@ -432,6 +448,7 @@ pub async fn list_handler<C: CryptoProvider + Clone + Send + Sync + 'static>(
             &headers,
             &jwt_secret,
             &session_store,
+            &failed_login_tracker,
             move |email_str, password| {
                 let email = Email::parse(email_str).map_err(|e| {
                     auth::AuthError::InvalidCredentials(format!("invalid email: {e}"))
@@ -487,6 +504,7 @@ pub async fn view_handler<C: CryptoProvider + Clone + Send + Sync + 'static>(
     let db_path = state.db_path.clone();
     let jwt_secret = state.jwt_secret.clone();
     let session_store = state.session_store.clone();
+    let failed_login_tracker = state.failed_login_tracker.clone();
     let crypto = state.crypto.clone();
 
     tokio::task::spawn_blocking(move || {
@@ -497,6 +515,7 @@ pub async fn view_handler<C: CryptoProvider + Clone + Send + Sync + 'static>(
             &headers,
             &jwt_secret,
             &session_store,
+            &failed_login_tracker,
             move |email_str, password| {
                 let email = Email::parse(email_str).map_err(|e| {
                     auth::AuthError::InvalidCredentials(format!("invalid email: {e}"))
@@ -558,6 +577,7 @@ pub async fn delete_handler<C: CryptoProvider + Clone + Send + Sync + 'static>(
     let db_path = state.db_path.clone();
     let jwt_secret = state.jwt_secret.clone();
     let session_store = state.session_store.clone();
+    let failed_login_tracker = state.failed_login_tracker.clone();
     let crypto = state.crypto.clone();
 
     tokio::task::spawn_blocking(move || {
@@ -568,6 +588,7 @@ pub async fn delete_handler<C: CryptoProvider + Clone + Send + Sync + 'static>(
             &headers,
             &jwt_secret,
             &session_store,
+            &failed_login_tracker,
             move |email_str, password| {
                 let email = Email::parse(email_str).map_err(|e| {
                     auth::AuthError::InvalidCredentials(format!("invalid email: {e}"))
@@ -638,7 +659,7 @@ pub async fn generate_handler(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::auth::{JwtSecret, SessionStore};
+    use crate::auth::{FailedLoginTracker, JwtSecret, SessionStore};
     use crate::crypto_operations::FakeCrypto;
     use crate::http_api::AppState;
     use axum::Router;
@@ -674,6 +695,7 @@ mod tests {
                 auth_db_path: auth_db_path.clone(),
                 jwt_secret: Arc::new(JwtSecret::new("test-jwt-secret-for-handlers".to_string())),
                 session_store: SessionStore::new(),
+                failed_login_tracker: FailedLoginTracker::new(),
                 crypto: FakeCrypto,
             };
 
@@ -1191,5 +1213,54 @@ mod tests {
             .unwrap();
         let resp = app.request(req).await;
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    // ════════════════════════════════════════════
+    // Brute-force protection
+    // ════════════════════════════════════════════
+
+    #[tokio::test]
+    async fn login_locked_after_max_attempts() {
+        use crate::auth::failed_login_tracker::MAX_FAILED_ATTEMPTS;
+
+        let app = TestApp::new();
+
+        // Register
+        let req = Request::builder()
+            .method("POST")
+            .uri("/register")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"email":"victim@example.com","master_password":"Secret123!"}"#,
+            ))
+            .unwrap();
+        let resp = app.request(req).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // MAX_FAILED_ATTEMPTS раз неверный пароль → 401
+        for _ in 0..MAX_FAILED_ATTEMPTS {
+            let req = Request::builder()
+                .method("POST")
+                .uri("/login")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"email":"victim@example.com","master_password":"WrongPass!"}"#,
+                ))
+                .unwrap();
+            let resp = app.request(req).await;
+            assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        }
+
+        // Следующая попытка (даже с ПРАВИЛЬНЫМ паролем) → 403
+        let req = Request::builder()
+            .method("POST")
+            .uri("/login")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"email":"victim@example.com","master_password":"Secret123!"}"#,
+            ))
+            .unwrap();
+        let resp = app.request(req).await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
     }
 }

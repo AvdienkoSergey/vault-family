@@ -62,6 +62,7 @@ vault-family/
 │   ├── auth/                   # Guard — аутентификация и сессии
 │   │   ├── mod.rs              #   guard() — единая точка входа, AuthError
 │   │   ├── session_store.rs    #   SessionStore — EncryptionKey в памяти сервера
+│   │   ├── failed_login_tracker.rs #   Brute-force защита (счётчик неудачных попыток)
 │   │   ├── jwt_provider.rs     #   JWT Claims, create/decode access tokens
 │   │   ├── jwt_secret.rs       #   Загрузка/генерация JWT secret
 │   │   ├── jwt_store.rs        #   AuthStore — refresh_tokens в auth.db
@@ -406,12 +407,14 @@ POST /refresh  →  новая пара {access_token, refresh_token}
 #### guard() — единая точка входа
 
 ```rust
-auth::guard(&headers, &jwt_secret, &session_store, |email, password| {
+auth::guard(&headers, &jwt_secret, &session_store, &failed_login_tracker, |email, password| {
     vault_db.create_pass(email, password)
 })
 ```
 
 `guard()` пробует Bearer JWT (быстрый путь: decode JWT → `session_store.get(sub)` → ek), при неудаче — извлекает Basic Auth credentials и вызывает `verify` callback. При Basic Auth кэширует ek в SessionStore для будущих JWT-запросов. Closure-based DI: auth/ не зависит от vault/ напрямую.
+
+**Brute-force защита:** перед проверкой пароля `guard()` проверяет `tracker.is_locked(email)`. При неудачной попытке — `tracker.record_failed_attempt(email)`. После `MAX_FAILED_ATTEMPTS` (5) неудачных попыток за `FAILED_ATTEMPTS_WINDOW_SECS` (300 сек) — возвращает `AuthError::AccountLocked` → 403 Forbidden. Блокировка временная, старые попытки протухают автоматически.
 
 #### JWT Claims (access_token)
 
@@ -439,6 +442,31 @@ POST /refresh вызывается **после** истечения access_toke
 - In-memory: при перезапуске сервера все сессии теряются (пользователи перелогиниваются)
 - Один процесс: HashMap не шарится между инстансами (горизонтальное масштабирование → Redis)
 - 1–5 пользователей: cleanup O(n) при каждом insert — незаметно
+
+#### FailedLoginTracker — brute-force защита
+
+```
+FailedLoginTracker: Arc<RwLock<HashMap<String, Vec<DateTime<Utc>>>>>
+
+Ключ:     email (String)
+Значение: Vec<DateTime<Utc>> — временны́е метки неудачных попыток
+
+Константы:
+  MAX_FAILED_ATTEMPTS       = 5       попыток
+  FAILED_ATTEMPTS_WINDOW_SECS = 300   секунд (5 минут)
+```
+
+**Где проверяется:**
+- `guard()` — Basic Auth путь (перед `verify`, после неудачного `verify`)
+- `login_handler` — перед `create_pass()`, после неудачного `create_pass()`
+- Bearer JWT — **не проверяется** (нет пароля → нет brute-force)
+
+**Поведение:** 5 неудачных попыток за 5 минут → 403 Forbidden. Блокировка временная — старые попытки протухают по TTL. Сброс при успешном логине не нужен.
+
+**Ограничения:**
+- In-memory: при перезапуске сервера счётчики сбрасываются
+- По email, не по IP (в Axum без reverse proxy IP = 127.0.0.1)
+- Не защищает от distributed brute-force (разные email) — для этого нужен rate limiter по IP
 
 #### JWT Secret
 
@@ -536,6 +564,7 @@ curl "http://127.0.0.1:3000/generate?length=32&symbols=false"
 - **Bearer + Basic fallback** — PWA использует JWT, CLI может использовать Basic Auth для обратной совместимости
 - **Server-side session store** — EncryptionKey хранится в памяти сервера (`SessionStore`), не в JWT payload. JWT содержит только идентификацию (`sub` + `email`). Перехват токена не даёт ключ шифрования
 - **Instant revocation** — POST /logout убивает сессию (`session_store.remove`) + все refresh-токены (`auth.db DELETE`). Старые JWT → 401 мгновенно, без ожидания exp
+- **Brute-force защита** — `FailedLoginTracker` считает неудачные попытки по email. 5 попыток за 5 минут → 403 Forbidden. In-memory, конфигурируется через `const`
 - **Refresh rotation** — каждый `/refresh` инвалидирует старый токен, защищая от кражи
 - **spawn_blocking** — все DB-операции в blocking closure, т.к. `rusqlite::Connection` не реализует `Send`
 - **Typestate сохранён** — каждый запрос проходит lifecycle: `DB<Closed> → DB<Open> → enter(VaultPass) → DB<Authenticated> → drop`
@@ -654,6 +683,7 @@ PasswordGenerator<Empty, N>  →  PasswordGenerator<Ready, N>
  ✅ 11. Email валидация по RFC 5321/5322 (email_address crate)
  ✅ 12. auth/ и vault/ не зависят друг от друга (dependency inversion через closure)
  ✅ 13. EncryptionKey не в JWT — хранится в SessionStore (Zeroizing, серверная память)
+ ✅ 14. Brute-force защита — FailedLoginTracker блокирует аккаунт по email (403)
 ```
 
 ## Крипто-операции
@@ -693,7 +723,7 @@ decrypt_entry(&EncryptedEntry, &EncryptionKey) → PlainEntry
 
 ## Тесты
 
-110 unit-тестов покрывают все модули:
+118 unit-тестов покрывают все модули:
 
 ```
 cargo test
@@ -708,13 +738,15 @@ types::tests                              (8 тестов)  — Email::parse() +
 ├── vault_pass_into_parts
 └── vault_pass_debug_hides_secrets
 
-auth::tests                               (7 тестов)  — guard() единая точка входа
+auth::tests                               (9 тестов)  — guard() единая точка входа + brute-force
 ├── guard_jwt_valid_token
 ├── guard_jwt_without_session_returns_session_expired
 ├── guard_jwt_invalid_token
 ├── guard_basic_auth_calls_verify
 ├── guard_basic_auth_verify_fails
 ├── guard_no_auth_header
+├── guard_basic_auth_locked_returns_account_locked
+├── guard_basic_auth_records_failed_attempt
 └── auth_db_path_from_vault_path
 
 auth::basic_provider::tests               (4 теста)   — Basic Auth extraction
@@ -738,6 +770,13 @@ auth::jwt_store::tests                    (6 тестов)  — AuthStore (auth.
 ├── verify_nonexistent_token_fails
 ├── delete_all_user_tokens_clears_tokens
 └── delete_all_user_tokens_does_not_affect_other_users
+
+auth::failed_login_tracker::tests         (5 тестов)  — Brute-force защита
+├── record_and_check_not_locked
+├── locked_after_max_attempts
+├── old_attempts_expire
+├── different_emails_isolated
+└── clone_shares_state
 
 auth::session_store::tests               (7 тестов)  — SessionStore (серверная память)
 ├── insert_and_get
@@ -778,7 +817,7 @@ password_generator::tests                 (24 теста)
 ├── generate (correct length, charset compliance, uniqueness, variety)
 └── secure (preset length 20, all charsets)
 
-http_api::handlers::tests                 (20 тестов) — Integration (FakeCrypto + TestApp)
+http_api::handlers::tests                 (21 тест)  — Integration (FakeCrypto + TestApp)
 ├── health_returns_ok
 ├── generate_returns_password_of_requested_length
 ├── register_creates_user
@@ -798,7 +837,8 @@ http_api::handlers::tests                 (20 тестов) — Integration (Fak
 ├── refresh_with_wrong_token_returns_401
 ├── logout_revokes_session
 ├── logout_revokes_refresh_token
-└── logout_without_token_returns_401
+├── logout_without_token_returns_401
+└── login_locked_after_max_attempts
 ```
 
 `CryptoProvider` trait позволяет тестировать DB-логику без реальной криптографии:
@@ -890,10 +930,11 @@ style: описание     → без bump
 - [x] Bearer + Basic Auth fallback (CLI-совместимость)
 - [x] Server-side SessionStore: encryption_key в памяти сервера, не в JWT payload
 - [x] Instant revocation: POST /logout убивает сессию + refresh-токены мгновенно
+- [x] Brute-force защита: FailedLoginTracker (5 попыток / 5 минут → 403)
 - [x] JWT Secret: env var → файл → автогенерация
 - [x] Архитектура Guard → Pass → Storage (auth/ и vault/ развязаны через VaultPass)
 - [x] Отдельные БД: vault.db (users + entries), auth.db (refresh_tokens)
-- [x] Unit-тесты (110 тестов: types, auth, session_store, vault, crypto, password_generator, handlers)
+- [x] Unit-тесты (118 тестов: types, auth, failed_login_tracker, session_store, vault, crypto, password_generator, handlers)
 - [ ] PWA фронтенд с E2E шифрованием в браузере
 - [ ] Деплой на Hetzner CX23 Helsinki
 - [ ] Браузерное расширение с автозаполнением

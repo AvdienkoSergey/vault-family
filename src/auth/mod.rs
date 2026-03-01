@@ -7,6 +7,7 @@
 //! Единственный мост между auth и vault — `VaultPass` из `types.rs`.
 
 pub mod basic_provider;
+pub mod failed_login_tracker;
 pub mod jwt_provider;
 pub mod jwt_secret;
 pub mod jwt_store;
@@ -18,6 +19,7 @@ use axum::http::StatusCode;
 
 // Re-exports для удобства
 pub use basic_provider::Credentials;
+pub use failed_login_tracker::FailedLoginTracker;
 pub use jwt_provider::{Claims, JwtError, REFRESH_TOKEN_TTL_DAYS};
 pub use jwt_store::{AuthStore, StoreError};
 pub use jwt_types::{JwtSecret, RefreshTokenHash};
@@ -37,6 +39,8 @@ pub enum AuthError {
     InvalidCredentials(String),
     /// EncryptionKey не найден в SessionStore (сервер перезапустился или сессия истекла)
     SessionExpired,
+    /// Слишком много неудачных попыток входа (brute-force защита)
+    AccountLocked,
     /// Ошибка хранилища refresh-токенов
     Store(StoreError),
 }
@@ -50,6 +54,9 @@ impl std::fmt::Display for AuthError {
             AuthError::InvalidToken(msg) => write!(f, "invalid token: {msg}"),
             AuthError::InvalidCredentials(msg) => write!(f, "invalid credentials: {msg}"),
             AuthError::SessionExpired => write!(f, "session expired, please re-login"),
+            AuthError::AccountLocked => {
+                write!(f, "account temporarily locked, too many failed attempts")
+            }
             AuthError::Store(e) => write!(f, "auth store error: {e}"),
         }
     }
@@ -75,6 +82,7 @@ impl From<AuthError> for StatusCode {
             AuthError::InvalidToken(_) => StatusCode::UNAUTHORIZED,
             AuthError::InvalidCredentials(_) => StatusCode::UNAUTHORIZED,
             AuthError::SessionExpired => StatusCode::UNAUTHORIZED,
+            AuthError::AccountLocked => StatusCode::FORBIDDEN,
             AuthError::Store(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
@@ -121,12 +129,14 @@ pub fn guard<F>(
     headers: &axum::http::HeaderMap,
     jwt_secret: &JwtSecret,
     session_store: &SessionStore,
+    tracker: &FailedLoginTracker,
     verify: F,
 ) -> Result<VaultPass, AuthError>
 where
     F: FnOnce(String, MasterPassword) -> Result<VaultPass, AuthError>,
 {
     // 1. Bearer JWT — быстрый путь, ek из серверной памяти
+    //    Нет пароля → нет brute-force → tracker не проверяем.
     if let Some(token) = extract_bearer_token(headers) {
         let claims = jwt_provider::decode_access_token(&token, jwt_secret)?;
 
@@ -144,7 +154,20 @@ where
     // 2. Basic Auth — fallback, делегируем проверку пароля вызывающему
     let creds = basic_provider::extract_basic_auth(headers).map_err(|_| AuthError::MissingAuth)?;
 
-    let pass = verify(creds.email, creds.master_password)?;
+    // 2a. Brute-force: проверяем блокировку ДО проверки пароля
+    if tracker.is_locked(&creds.email) {
+        return Err(AuthError::AccountLocked);
+    }
+
+    // 2b. Проверка пароля
+    let pass = match verify(creds.email.clone(), creds.master_password) {
+        Ok(pass) => pass,
+        Err(e) => {
+            // 2c. Неудачная попытка — фиксируем
+            tracker.record_failed_attempt(&creds.email);
+            return Err(e);
+        }
+    };
 
     // Кэшируем ek для будущих JWT-запросов
     session_store.insert(
@@ -228,7 +251,8 @@ mod tests {
             panic!("verify should not be called for JWT path");
         };
 
-        let pass = guard(&headers, &secret, &store, unreachable_verify).unwrap();
+        let tracker = FailedLoginTracker::new();
+        let pass = guard(&headers, &secret, &store, &tracker, unreachable_verify).unwrap();
 
         assert_eq!(pass.user_id().as_str(), "user-1");
         assert_eq!(pass.email().as_str(), "alex@icloud.com");
@@ -252,7 +276,8 @@ mod tests {
             panic!("verify should not be called for JWT path");
         };
 
-        let result = guard(&headers, &secret, &store, unreachable_verify);
+        let tracker = FailedLoginTracker::new();
+        let result = guard(&headers, &secret, &store, &tracker, unreachable_verify);
         assert!(matches!(result, Err(AuthError::SessionExpired)));
     }
 
@@ -265,7 +290,8 @@ mod tests {
             panic!("verify should not be called for invalid JWT");
         };
 
-        let result = guard(&headers, &secret, &store, unreachable_verify);
+        let tracker = FailedLoginTracker::new();
+        let result = guard(&headers, &secret, &store, &tracker, unreachable_verify);
         assert!(result.is_err());
     }
 
@@ -289,7 +315,8 @@ mod tests {
             ))
         };
 
-        let pass = guard(&headers, &secret, &store, verify).unwrap();
+        let tracker = FailedLoginTracker::new();
+        let pass = guard(&headers, &secret, &store, &tracker, verify).unwrap();
 
         assert_eq!(pass.user_id().as_str(), "user-42");
 
@@ -308,7 +335,8 @@ mod tests {
             Err(AuthError::InvalidCredentials("wrong password".to_string()))
         };
 
-        let result = guard(&headers, &secret, &store, verify);
+        let tracker = FailedLoginTracker::new();
+        let result = guard(&headers, &secret, &store, &tracker, verify);
         assert!(matches!(result, Err(AuthError::InvalidCredentials(_))));
     }
 
@@ -325,8 +353,51 @@ mod tests {
             panic!("verify should not be called with no headers");
         };
 
-        let result = guard(&headers, &secret, &store, unreachable_verify);
+        let tracker = FailedLoginTracker::new();
+        let result = guard(&headers, &secret, &store, &tracker, unreachable_verify);
         assert!(matches!(result, Err(AuthError::MissingAuth)));
+    }
+
+    // ════════════════════════════════════════════
+    // guard() — brute-force protection
+    // ════════════════════════════════════════════
+
+    #[test]
+    fn guard_basic_auth_locked_returns_account_locked() {
+        let secret = test_secret();
+        let store = SessionStore::new();
+        let tracker = FailedLoginTracker::new();
+        let headers = make_basic_headers("alice@example.com", "any-password");
+
+        // Заполняем трекер MAX попытками
+        for _ in 0..failed_login_tracker::MAX_FAILED_ATTEMPTS {
+            tracker.record_failed_attempt("alice@example.com");
+        }
+
+        let verify = |_: String, _: MasterPassword| -> Result<VaultPass, AuthError> {
+            panic!("verify should not be called when account is locked");
+        };
+
+        let result = guard(&headers, &secret, &store, &tracker, verify);
+        assert!(matches!(result, Err(AuthError::AccountLocked)));
+    }
+
+    #[test]
+    fn guard_basic_auth_records_failed_attempt() {
+        let secret = test_secret();
+        let store = SessionStore::new();
+        let tracker = FailedLoginTracker::new();
+        let headers = make_basic_headers("alice@example.com", "WrongPassword!");
+
+        let verify = |_: String, _: MasterPassword| -> Result<VaultPass, AuthError> {
+            Err(AuthError::InvalidCredentials("wrong".to_string()))
+        };
+
+        // Первая неудачная попытка — не заблокирован
+        let result = guard(&headers, &secret, &store, &tracker, verify);
+        assert!(matches!(result, Err(AuthError::InvalidCredentials(_))));
+        // Трекер зафиксировал попытку, но ещё не locked
+        assert!(!tracker.is_locked("alice@example.com"));
     }
 
     // ════════════════════════════════════════════
