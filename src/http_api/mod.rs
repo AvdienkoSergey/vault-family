@@ -14,7 +14,7 @@ use crate::crypto_operations::{CryptoProvider, RealCrypto};
 
 use handlers::{
     add_handler, delete_handler, generate_handler, health_handler, list_handler, login_handler,
-    refresh_handler, register_handler, view_handler,
+    logout_handler, refresh_handler, register_handler, view_handler,
 };
 
 // ════════════════════════════════════════════════════════════════════
@@ -78,6 +78,7 @@ pub async fn run_server(host: &str, port: u16, db_path: String) -> Result<(), Se
     let app: Router = Router::new()
         .route("/health", get(health_handler))
         .route("/login", post(login_handler::<RealCrypto>))
+        .route("/logout", post(logout_handler::<RealCrypto>))
         .route("/refresh", post(refresh_handler::<RealCrypto>))
         .route("/register", post(register_handler::<RealCrypto>))
         .route("/add", post(add_handler::<RealCrypto>))

@@ -116,6 +116,11 @@ pub struct RefreshRequest {
     access_token: String,
 }
 
+#[derive(Serialize)]
+pub struct LogoutResponse {
+    message: String,
+}
+
 // ════════════════════════════════════════════════════════════════════
 // Handlers
 // ════════════════════════════════════════════════════════════════════
@@ -245,6 +250,61 @@ pub async fn refresh_handler<C: CryptoProvider + Clone + Send + Sync + 'static>(
         Ok(Json(LoginResponse {
             access_token,
             refresh_token: new_refresh_token,
+        }))
+    })
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+}
+
+/// POST /logout
+///
+/// Мгновенная revocation: убиваем сессию в SessionStore + все refresh-токены.
+/// После logout:
+/// - Все Bearer JWT → 401 SessionExpired (мгновенно, не через 15 мин)
+/// - Все refresh_token → 401 TokenNotFound (нечем обновить)
+pub async fn logout_handler<C: CryptoProvider + Clone + Send + Sync + 'static>(
+    State(state): State<AppState<C>>,
+    headers: axum::http::HeaderMap,
+) -> Result<Json<LogoutResponse>, StatusCode> {
+    let db_path = state.db_path.clone();
+    let auth_db_path = state.auth_db_path.clone();
+    let jwt_secret = state.jwt_secret.clone();
+    let session_store = state.session_store.clone();
+    let crypto = state.crypto.clone();
+
+    tokio::task::spawn_blocking(move || {
+        // Вахтер: подтверждаем личность
+        let crypto_for_verify = crypto.clone();
+        let db_path_for_verify = db_path.clone();
+        let pass = auth::guard(
+            &headers,
+            &jwt_secret,
+            &session_store,
+            move |email_str, password| {
+                let email = Email::parse(email_str).map_err(|e| {
+                    auth::AuthError::InvalidCredentials(format!("invalid email: {e}"))
+                })?;
+                let db = DB::<Closed, C>::new(crypto_for_verify)
+                    .open(&db_path_for_verify)
+                    .map_err(|e| auth::AuthError::InvalidCredentials(format!("db error: {e}")))?;
+                db.create_pass(email, password)
+                    .map_err(|e| auth::AuthError::InvalidCredentials(e.to_string()))
+            },
+        )
+        .map_err(StatusCode::from)?;
+
+        // 1. SessionStore: убиваем сессию → все JWT мгновенно невалидны
+        session_store.remove(pass.user_id().as_str());
+
+        // 2. AuthStore: удаляем все refresh-токены → нечем обновить access_token
+        let store =
+            AuthStore::open(&auth_db_path).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        store
+            .delete_all_user_tokens(pass.user_id().as_str())
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+        Ok(Json(LogoutResponse {
+            message: "logged out".to_string(),
         }))
     })
     .await
@@ -620,6 +680,7 @@ mod tests {
             let router = Router::new()
                 .route("/health", get(health_handler))
                 .route("/login", post(login_handler::<FakeCrypto>))
+                .route("/logout", post(logout_handler::<FakeCrypto>))
                 .route("/refresh", post(refresh_handler::<FakeCrypto>))
                 .route("/register", post(register_handler::<FakeCrypto>))
                 .route("/add", post(add_handler::<FakeCrypto>))
@@ -1044,6 +1105,89 @@ mod tests {
                 })
                 .to_string(),
             ))
+            .unwrap();
+        let resp = app.request(req).await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    // ════════════════════════════════════════════
+    // Logout (revocation)
+    // ════════════════════════════════════════════
+
+    #[tokio::test]
+    async fn logout_revokes_session() {
+        let app = TestApp::new();
+        let (token, _) = register_and_login(&app).await;
+
+        // Bearer работает до logout
+        let req = Request::builder()
+            .uri("/list")
+            .header("authorization", format!("Bearer {token}"))
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.request(req).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Logout
+        let req = Request::builder()
+            .method("POST")
+            .uri("/logout")
+            .header("authorization", format!("Bearer {token}"))
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.request(req).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Bearer после logout → 401 (SessionExpired)
+        let req = Request::builder()
+            .uri("/list")
+            .header("authorization", format!("Bearer {token}"))
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.request(req).await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn logout_revokes_refresh_token() {
+        let app = TestApp::new();
+        let (access_token, refresh_token) = register_and_login(&app).await;
+
+        // Logout
+        let req = Request::builder()
+            .method("POST")
+            .uri("/logout")
+            .header("authorization", format!("Bearer {access_token}"))
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.request(req).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Refresh после logout → 401 (токен удалён из auth.db)
+        let req = Request::builder()
+            .method("POST")
+            .uri("/refresh")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({
+                    "access_token": access_token,
+                    "refresh_token": refresh_token,
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        let resp = app.request(req).await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn logout_without_token_returns_401() {
+        let app = TestApp::new();
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/logout")
+            .body(Body::empty())
             .unwrap();
         let resp = app.request(req).await;
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
