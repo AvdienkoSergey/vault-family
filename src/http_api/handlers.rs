@@ -277,34 +277,13 @@ pub async fn logout_handler<C: CryptoProvider + Clone + Send + Sync + 'static>(
     State(state): State<AppState<C>>,
     headers: axum::http::HeaderMap,
 ) -> Result<Json<LogoutResponse>, StatusCode> {
-    let db_path = state.db_path.clone();
     let auth_db_path = state.auth_db_path.clone();
     let jwt_secret = state.jwt_secret.clone();
     let session_store = state.session_store.clone();
-    let failed_login_tracker = state.failed_login_tracker.clone();
-    let crypto = state.crypto.clone();
 
     tokio::task::spawn_blocking(move || {
-        // Вахтер: подтверждаем личность
-        let crypto_for_verify = crypto.clone();
-        let db_path_for_verify = db_path.clone();
-        let pass = auth::guard(
-            &headers,
-            &jwt_secret,
-            &session_store,
-            &failed_login_tracker,
-            move |email_str, password| {
-                let email = Email::parse(email_str).map_err(|e| {
-                    auth::AuthError::InvalidCredentials(format!("invalid email: {e}"))
-                })?;
-                let db = DB::<Closed, C>::new(crypto_for_verify)
-                    .open(&db_path_for_verify)
-                    .map_err(|e| auth::AuthError::InvalidCredentials(format!("db error: {e}")))?;
-                db.create_pass(email, password)
-                    .map_err(|e| auth::AuthError::InvalidCredentials(e.to_string()))
-            },
-        )
-        .map_err(StatusCode::from)?;
+        // Вахтер: JWT-only
+        let pass = auth::guard(&headers, &jwt_secret, &session_store).map_err(StatusCode::from)?;
 
         // 1. SessionStore: убиваем сессию → все JWT мгновенно невалидны
         session_store.remove(pass.user_id().as_str());
@@ -363,30 +342,11 @@ pub async fn add_handler<C: CryptoProvider + Clone + Send + Sync + 'static>(
     let db_path = state.db_path.clone();
     let jwt_secret = state.jwt_secret.clone();
     let session_store = state.session_store.clone();
-    let failed_login_tracker = state.failed_login_tracker.clone();
     let crypto = state.crypto.clone();
 
     tokio::task::spawn_blocking(move || {
-        // Вахтер: Bearer JWT (быстрый путь) или Basic Auth (fallback)
-        let crypto_for_verify = crypto.clone();
-        let db_path_for_verify = db_path.clone();
-        let pass = auth::guard(
-            &headers,
-            &jwt_secret,
-            &session_store,
-            &failed_login_tracker,
-            move |email_str, password| {
-                let email = Email::parse(email_str).map_err(|e| {
-                    auth::AuthError::InvalidCredentials(format!("invalid email: {e}"))
-                })?;
-                let db = DB::<Closed, C>::new(crypto_for_verify)
-                    .open(&db_path_for_verify)
-                    .map_err(|e| auth::AuthError::InvalidCredentials(format!("db error: {e}")))?;
-                db.create_pass(email, password)
-                    .map_err(|e| auth::AuthError::InvalidCredentials(e.to_string()))
-            },
-        )
-        .map_err(StatusCode::from)?;
+        // Вахтер: JWT-only
+        let pass = auth::guard(&headers, &jwt_secret, &session_store).map_err(StatusCode::from)?;
 
         // Хранилище: входим с пропуском
         let db = DB::<Closed, C>::new(crypto)
@@ -437,30 +397,11 @@ pub async fn list_handler<C: CryptoProvider + Clone + Send + Sync + 'static>(
     let db_path = state.db_path.clone();
     let jwt_secret = state.jwt_secret.clone();
     let session_store = state.session_store.clone();
-    let failed_login_tracker = state.failed_login_tracker.clone();
     let crypto = state.crypto.clone();
 
     tokio::task::spawn_blocking(move || {
-        // Вахтер
-        let crypto_for_verify = crypto.clone();
-        let db_path_for_verify = db_path.clone();
-        let pass = auth::guard(
-            &headers,
-            &jwt_secret,
-            &session_store,
-            &failed_login_tracker,
-            move |email_str, password| {
-                let email = Email::parse(email_str).map_err(|e| {
-                    auth::AuthError::InvalidCredentials(format!("invalid email: {e}"))
-                })?;
-                let db = DB::<Closed, C>::new(crypto_for_verify)
-                    .open(&db_path_for_verify)
-                    .map_err(|e| auth::AuthError::InvalidCredentials(format!("db error: {e}")))?;
-                db.create_pass(email, password)
-                    .map_err(|e| auth::AuthError::InvalidCredentials(e.to_string()))
-            },
-        )
-        .map_err(StatusCode::from)?;
+        // Вахтер: JWT-only
+        let pass = auth::guard(&headers, &jwt_secret, &session_store).map_err(StatusCode::from)?;
 
         // Хранилище
         let db = DB::<Closed, C>::new(crypto)
@@ -504,30 +445,11 @@ pub async fn view_handler<C: CryptoProvider + Clone + Send + Sync + 'static>(
     let db_path = state.db_path.clone();
     let jwt_secret = state.jwt_secret.clone();
     let session_store = state.session_store.clone();
-    let failed_login_tracker = state.failed_login_tracker.clone();
     let crypto = state.crypto.clone();
 
     tokio::task::spawn_blocking(move || {
-        // Вахтер
-        let crypto_for_verify = crypto.clone();
-        let db_path_for_verify = db_path.clone();
-        let pass = auth::guard(
-            &headers,
-            &jwt_secret,
-            &session_store,
-            &failed_login_tracker,
-            move |email_str, password| {
-                let email = Email::parse(email_str).map_err(|e| {
-                    auth::AuthError::InvalidCredentials(format!("invalid email: {e}"))
-                })?;
-                let db = DB::<Closed, C>::new(crypto_for_verify)
-                    .open(&db_path_for_verify)
-                    .map_err(|e| auth::AuthError::InvalidCredentials(format!("db error: {e}")))?;
-                db.create_pass(email, password)
-                    .map_err(|e| auth::AuthError::InvalidCredentials(e.to_string()))
-            },
-        )
-        .map_err(StatusCode::from)?;
+        // Вахтер: JWT-only
+        let pass = auth::guard(&headers, &jwt_secret, &session_store).map_err(StatusCode::from)?;
 
         // Хранилище
         let db = DB::<Closed, C>::new(crypto)
@@ -577,30 +499,11 @@ pub async fn delete_handler<C: CryptoProvider + Clone + Send + Sync + 'static>(
     let db_path = state.db_path.clone();
     let jwt_secret = state.jwt_secret.clone();
     let session_store = state.session_store.clone();
-    let failed_login_tracker = state.failed_login_tracker.clone();
     let crypto = state.crypto.clone();
 
     tokio::task::spawn_blocking(move || {
-        // Вахтер
-        let crypto_for_verify = crypto.clone();
-        let db_path_for_verify = db_path.clone();
-        let pass = auth::guard(
-            &headers,
-            &jwt_secret,
-            &session_store,
-            &failed_login_tracker,
-            move |email_str, password| {
-                let email = Email::parse(email_str).map_err(|e| {
-                    auth::AuthError::InvalidCredentials(format!("invalid email: {e}"))
-                })?;
-                let db = DB::<Closed, C>::new(crypto_for_verify)
-                    .open(&db_path_for_verify)
-                    .map_err(|e| auth::AuthError::InvalidCredentials(format!("db error: {e}")))?;
-                db.create_pass(email, password)
-                    .map_err(|e| auth::AuthError::InvalidCredentials(e.to_string()))
-            },
-        )
-        .map_err(StatusCode::from)?;
+        // Вахтер: JWT-only
+        let pass = auth::guard(&headers, &jwt_secret, &session_store).map_err(StatusCode::from)?;
 
         // Хранилище
         let db = DB::<Closed, C>::new(crypto)

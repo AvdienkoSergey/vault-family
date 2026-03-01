@@ -1,12 +1,11 @@
 //! Модуль Вахтер — аутентификация и управление сессиями.
 //!
-//! Отвечает за проверку личности (JWT, Basic Auth, будущий OAuth).
+//! Отвечает за проверку личности (JWT-only).
 //! Результат работы — `VaultPass` (Пропуск), который передаётся в Хранилище.
 //!
 //! **Не зависит от vault/** — не знает про записи, шифрование, entries.
 //! Единственный мост между auth и vault — `VaultPass` из `types.rs`.
 
-pub mod basic_provider;
 pub mod failed_login_tracker;
 pub mod jwt_provider;
 pub mod jwt_secret;
@@ -14,11 +13,10 @@ pub mod jwt_store;
 mod jwt_types;
 pub mod session_store;
 
-use crate::types::{EncryptionKey, MasterPassword, UserId, VaultPass};
+use crate::types::{UserId, VaultPass};
 use axum::http::StatusCode;
 
 // Re-exports для удобства
-pub use basic_provider::Credentials;
 pub use failed_login_tracker::FailedLoginTracker;
 pub use jwt_provider::{Claims, JwtError, REFRESH_TOKEN_TTL_DAYS};
 pub use jwt_store::{AuthStore, StoreError};
@@ -31,7 +29,7 @@ pub use session_store::SessionStore;
 
 #[derive(Debug)]
 pub enum AuthError {
-    /// Нет ни Bearer, ни Basic заголовка
+    /// Нет Bearer заголовка
     MissingAuth,
     /// Токен невалиден (подпись, формат, expiration)
     InvalidToken(String),
@@ -101,81 +99,37 @@ fn extract_bearer_token(headers: &axum::http::HeaderMap) -> Option<String> {
     header.strip_prefix("Bearer ").map(|t| t.to_string())
 }
 
-/// Единая точка аутентификации — Вахтер.
+/// Единая точка аутентификации — Вахтер (JWT-only).
 ///
-/// Пробует Bearer JWT (быстрый путь, ek из SessionStore),
-/// при неудаче — извлекает Basic Auth credentials
-/// и вызывает `verify` callback для проверки пароля.
+/// Извлекает Bearer JWT из заголовка Authorization,
+/// проверяет подпись и expiration, достаёт EncryptionKey из SessionStore.
 ///
-/// `verify` — замыкание, которое обычно вызывает `vault.create_pass()`.
-/// Это позволяет auth/ не зависеть от vault/ напрямую.
+/// Пароль не участвует → нет brute-force вектора на этом уровне.
+/// Brute-force защита — в `login_handler` (POST /login).
 ///
 /// # Примеры
 ///
 /// ```ignore
-/// // В HTTP handler:
-/// let pass = auth::guard(&headers, &jwt_secret, &session_store, |email, password| {
-///     let db = vault_db.open(&db_path)?;
-///     db.create_pass(email, password)
-///         .map_err(|e| AuthError::InvalidCredentials(e.to_string()))
-/// })?;
-///
-/// // JWT-only (без fallback):
-/// let pass = auth::guard(&headers, &jwt_secret, &session_store, |_, _| {
-///     Err(AuthError::MissingAuth)
-/// })?;
+/// let pass = auth::guard(&headers, &jwt_secret, &session_store)?;
 /// ```
-pub fn guard<F>(
+pub fn guard(
     headers: &axum::http::HeaderMap,
     jwt_secret: &JwtSecret,
     session_store: &SessionStore,
-    tracker: &FailedLoginTracker,
-    verify: F,
-) -> Result<VaultPass, AuthError>
-where
-    F: FnOnce(String, MasterPassword) -> Result<VaultPass, AuthError>,
-{
-    // 1. Bearer JWT — быстрый путь, ek из серверной памяти
-    //    Нет пароля → нет brute-force → tracker не проверяем.
-    if let Some(token) = extract_bearer_token(headers) {
-        let claims = jwt_provider::decode_access_token(&token, jwt_secret)?;
+) -> Result<VaultPass, AuthError> {
+    let token = extract_bearer_token(headers).ok_or(AuthError::MissingAuth)?;
 
-        let ek = session_store
-            .get(&claims.sub)
-            .ok_or(AuthError::SessionExpired)?;
+    let claims = jwt_provider::decode_access_token(&token, jwt_secret)?;
 
-        return Ok(VaultPass::new(
-            UserId::new(claims.sub),
-            crate::types::Email::new(claims.email),
-            ek,
-        ));
-    }
+    let ek = session_store
+        .get(&claims.sub)
+        .ok_or(AuthError::SessionExpired)?;
 
-    // 2. Basic Auth — fallback, делегируем проверку пароля вызывающему
-    let creds = basic_provider::extract_basic_auth(headers).map_err(|_| AuthError::MissingAuth)?;
-
-    // 2a. Brute-force: проверяем блокировку ДО проверки пароля
-    if tracker.is_locked(&creds.email) {
-        return Err(AuthError::AccountLocked);
-    }
-
-    // 2b. Проверка пароля
-    let pass = match verify(creds.email.clone(), creds.master_password) {
-        Ok(pass) => pass,
-        Err(e) => {
-            // 2c. Неудачная попытка — фиксируем
-            tracker.record_failed_attempt(&creds.email);
-            return Err(e);
-        }
-    };
-
-    // Кэшируем ek для будущих JWT-запросов
-    session_store.insert(
-        pass.user_id().as_str(),
-        &EncryptionKey::new(pass.encryption_key().as_str().to_string()),
-    );
-
-    Ok(pass)
+    Ok(VaultPass::new(
+        UserId::new(claims.sub),
+        crate::types::Email::new(claims.email),
+        ek,
+    ))
 }
 
 // ════════════════════════════════════════════════════════════════════
@@ -199,7 +153,7 @@ pub fn auth_db_path(vault_db_path: &str) -> String {
 mod tests {
     use super::JwtSecret;
     use super::*;
-    use crate::types::{Email, EncryptionKey, UserId, VaultPass};
+    use crate::types::{Email, EncryptionKey, UserId};
     use axum::http::{HeaderMap, HeaderValue, header::AUTHORIZATION};
 
     fn test_secret() -> JwtSecret {
@@ -211,18 +165,6 @@ mod tests {
         headers.insert(
             AUTHORIZATION,
             HeaderValue::from_str(&format!("Bearer {token}")).unwrap(),
-        );
-        headers
-    }
-
-    fn make_basic_headers(email: &str, password: &str) -> HeaderMap {
-        use base64::Engine;
-        let encoded =
-            base64::engine::general_purpose::STANDARD.encode(format!("{email}:{password}"));
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            AUTHORIZATION,
-            HeaderValue::from_str(&format!("Basic {encoded}")).unwrap(),
         );
         headers
     }
@@ -247,12 +189,7 @@ mod tests {
         .unwrap();
 
         let headers = make_bearer_headers(&token);
-        let unreachable_verify = |_: String, _: MasterPassword| -> Result<VaultPass, AuthError> {
-            panic!("verify should not be called for JWT path");
-        };
-
-        let tracker = FailedLoginTracker::new();
-        let pass = guard(&headers, &secret, &store, &tracker, unreachable_verify).unwrap();
+        let pass = guard(&headers, &secret, &store).unwrap();
 
         assert_eq!(pass.user_id().as_str(), "user-1");
         assert_eq!(pass.email().as_str(), "alex@icloud.com");
@@ -272,12 +209,7 @@ mod tests {
         .unwrap();
 
         let headers = make_bearer_headers(&token);
-        let unreachable_verify = |_: String, _: MasterPassword| -> Result<VaultPass, AuthError> {
-            panic!("verify should not be called for JWT path");
-        };
-
-        let tracker = FailedLoginTracker::new();
-        let result = guard(&headers, &secret, &store, &tracker, unreachable_verify);
+        let result = guard(&headers, &secret, &store);
         assert!(matches!(result, Err(AuthError::SessionExpired)));
     }
 
@@ -286,58 +218,9 @@ mod tests {
         let secret = test_secret();
         let store = SessionStore::new();
         let headers = make_bearer_headers("not-a-valid-jwt");
-        let unreachable_verify = |_: String, _: MasterPassword| -> Result<VaultPass, AuthError> {
-            panic!("verify should not be called for invalid JWT");
-        };
 
-        let tracker = FailedLoginTracker::new();
-        let result = guard(&headers, &secret, &store, &tracker, unreachable_verify);
+        let result = guard(&headers, &secret, &store);
         assert!(result.is_err());
-    }
-
-    // ════════════════════════════════════════════
-    // guard() — Basic Auth path
-    // ════════════════════════════════════════════
-
-    #[test]
-    fn guard_basic_auth_calls_verify() {
-        let secret = test_secret();
-        let store = SessionStore::new();
-        let headers = make_basic_headers("alex@icloud.com", "SuperSecret123!");
-
-        let verify = |email: String, password: MasterPassword| -> Result<VaultPass, AuthError> {
-            assert_eq!(email, "alex@icloud.com");
-            assert_eq!(password.as_str(), "SuperSecret123!");
-            Ok(VaultPass::new(
-                UserId::new("user-42".to_string()),
-                Email::new(email),
-                EncryptionKey::new("derived-key".to_string()),
-            ))
-        };
-
-        let tracker = FailedLoginTracker::new();
-        let pass = guard(&headers, &secret, &store, &tracker, verify).unwrap();
-
-        assert_eq!(pass.user_id().as_str(), "user-42");
-
-        // Basic Auth кэширует ek в session store
-        let cached_ek = store.get("user-42").unwrap();
-        assert_eq!(cached_ek.as_str(), "derived-key");
-    }
-
-    #[test]
-    fn guard_basic_auth_verify_fails() {
-        let secret = test_secret();
-        let store = SessionStore::new();
-        let headers = make_basic_headers("alex@icloud.com", "WrongPassword!");
-
-        let verify = |_: String, _: MasterPassword| -> Result<VaultPass, AuthError> {
-            Err(AuthError::InvalidCredentials("wrong password".to_string()))
-        };
-
-        let tracker = FailedLoginTracker::new();
-        let result = guard(&headers, &secret, &store, &tracker, verify);
-        assert!(matches!(result, Err(AuthError::InvalidCredentials(_))));
     }
 
     // ════════════════════════════════════════════
@@ -349,55 +232,28 @@ mod tests {
         let secret = test_secret();
         let store = SessionStore::new();
         let headers = HeaderMap::new();
-        let unreachable_verify = |_: String, _: MasterPassword| -> Result<VaultPass, AuthError> {
-            panic!("verify should not be called with no headers");
-        };
 
-        let tracker = FailedLoginTracker::new();
-        let result = guard(&headers, &secret, &store, &tracker, unreachable_verify);
+        let result = guard(&headers, &secret, &store);
         assert!(matches!(result, Err(AuthError::MissingAuth)));
     }
 
-    // ════════════════════════════════════════════
-    // guard() — brute-force protection
-    // ════════════════════════════════════════════
-
     #[test]
-    fn guard_basic_auth_locked_returns_account_locked() {
+    fn guard_basic_auth_header_treated_as_missing() {
+        use base64::Engine;
         let secret = test_secret();
         let store = SessionStore::new();
-        let tracker = FailedLoginTracker::new();
-        let headers = make_basic_headers("alice@example.com", "any-password");
 
-        // Заполняем трекер MAX попытками
-        for _ in 0..failed_login_tracker::MAX_FAILED_ATTEMPTS {
-            tracker.record_failed_attempt("alice@example.com");
-        }
+        let encoded =
+            base64::engine::general_purpose::STANDARD.encode("alice@example.com:password");
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            AUTHORIZATION,
+            HeaderValue::from_str(&format!("Basic {encoded}")).unwrap(),
+        );
 
-        let verify = |_: String, _: MasterPassword| -> Result<VaultPass, AuthError> {
-            panic!("verify should not be called when account is locked");
-        };
-
-        let result = guard(&headers, &secret, &store, &tracker, verify);
-        assert!(matches!(result, Err(AuthError::AccountLocked)));
-    }
-
-    #[test]
-    fn guard_basic_auth_records_failed_attempt() {
-        let secret = test_secret();
-        let store = SessionStore::new();
-        let tracker = FailedLoginTracker::new();
-        let headers = make_basic_headers("alice@example.com", "WrongPassword!");
-
-        let verify = |_: String, _: MasterPassword| -> Result<VaultPass, AuthError> {
-            Err(AuthError::InvalidCredentials("wrong".to_string()))
-        };
-
-        // Первая неудачная попытка — не заблокирован
-        let result = guard(&headers, &secret, &store, &tracker, verify);
-        assert!(matches!(result, Err(AuthError::InvalidCredentials(_))));
-        // Трекер зафиксировал попытку, но ещё не locked
-        assert!(!tracker.is_locked("alice@example.com"));
+        // Basic Auth больше не поддерживается — воспринимается как MissingAuth
+        let result = guard(&headers, &secret, &store);
+        assert!(matches!(result, Err(AuthError::MissingAuth)));
     }
 
     // ════════════════════════════════════════════
