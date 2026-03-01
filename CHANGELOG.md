@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.1.5](https://github.com/AvdienkoSergey/vault-family/compare/vault-family-v0.1.4...vault-family-v0.1.5) (2026-03-01)
+
+
+### Features
+
+* **auth:** add brute-force protection with FailedLoginTracker (5 attempts / 5 min → 403) ([e0aa6fa](https://github.com/AvdienkoSergey/vault-family/commit/e0aa6fa9e943e3e0460dbcaec27eacb42afb889d))
+* **auth:** add POST /logout with instant session and refresh token revocation ([1565701](https://github.com/AvdienkoSergey/vault-family/commit/1565701f25c6e62d9348fc9e05dbdc489812020d))
+
 ## [0.1.4](https://github.com/AvdienkoSergey/vault-family/compare/vault-family-v0.1.3...vault-family-v0.1.4) (2026-03-01)
 
 
