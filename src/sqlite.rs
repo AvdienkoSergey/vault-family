@@ -580,4 +580,119 @@ mod tests {
         );
         assert!(result.is_err());
     }
+
+    // ════════════════════════════════════════════
+    // Refresh tokens
+    // ════════════════════════════════════════════
+
+    /// Вставить refresh token напрямую через SQL (для тестов verify на DB<Open>)
+    fn insert_refresh_token(
+        db: &DB<Open, FakeCrypto>,
+        token_hash: &str,
+        user_id: &str,
+        expires_at: chrono::DateTime<Utc>,
+    ) {
+        db.conn
+            .execute(
+                "INSERT INTO refresh_tokens (token_hash, user_id, expires_at) VALUES (?1, ?2, ?3)",
+                rusqlite::params![token_hash, user_id, expires_at.to_rfc3339()],
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn save_and_verify_refresh_token() {
+        let db = open_test_db();
+        db.create_user(
+            Email::new("alex@icloud.com".to_string()),
+            MasterPassword::new("SuperSecret123!".to_string()),
+        )
+        .unwrap();
+
+        let hash = RefreshTokenHash::new("abc123hash".to_string());
+        let expires_at = Utc::now() + chrono::Duration::hours(1);
+        insert_refresh_token(&db, "abc123hash", "user-1", expires_at);
+
+        let user_id = db.verify_and_delete_refresh_token(&hash).unwrap();
+        assert_eq!(user_id.as_str(), "user-1");
+    }
+
+    #[test]
+    fn verify_deletes_token() {
+        let db = open_test_db();
+        let hash = RefreshTokenHash::new("abc123hash".to_string());
+        let expires_at = Utc::now() + chrono::Duration::hours(1);
+        insert_refresh_token(&db, "abc123hash", "user-1", expires_at);
+
+        db.verify_and_delete_refresh_token(&hash).unwrap();
+
+        // Повторный вызов — токен уже удалён (rotation)
+        assert!(db.verify_and_delete_refresh_token(&hash).is_err());
+    }
+
+    #[test]
+    fn verify_expired_token_fails() {
+        let db = open_test_db();
+        let hash = RefreshTokenHash::new("expired-hash".to_string());
+        let expires_at = Utc::now() - chrono::Duration::hours(1); // в прошлом
+        insert_refresh_token(&db, "expired-hash", "user-1", expires_at);
+
+        assert!(db.verify_and_delete_refresh_token(&hash).is_err());
+    }
+
+    #[test]
+    fn verify_nonexistent_token_fails() {
+        let db = open_test_db();
+        let hash = RefreshTokenHash::new("does-not-exist".to_string());
+
+        assert!(db.verify_and_delete_refresh_token(&hash).is_err());
+    }
+
+    // ════════════════════════════════════════════
+    // restore_session
+    // ════════════════════════════════════════════
+
+    #[test]
+    fn restore_session_works() {
+        let tmp = std::env::temp_dir().join("vault_test_restore.db");
+        let _ = std::fs::remove_file(&tmp); // clean slate
+
+        // 1. Создаём юзера и аутентифицируемся
+        let db = DB::<Closed, FakeCrypto>::new(FakeCrypto)
+            .open(tmp.to_str().unwrap())
+            .unwrap();
+        db.create_user(
+            Email::new("alex@icloud.com".to_string()),
+            MasterPassword::new("SuperSecret123!".to_string()),
+        )
+        .unwrap();
+        let auth_db = db
+            .authenticate(
+                Email::new("alex@icloud.com".to_string()),
+                MasterPassword::new("SuperSecret123!".to_string()),
+            )
+            .unwrap();
+        let user_id = UserId::new(auth_db.user_id().as_str().to_string());
+        let ek = types::EncryptionKey::new(auth_db.encryption_key().as_str().to_string());
+        drop(auth_db);
+
+        // 2. Новое соединение — restore_session без пароля
+        let db = DB::<Closed, FakeCrypto>::new(FakeCrypto)
+            .open(tmp.to_str().unwrap())
+            .unwrap();
+        let db = db.restore_session(user_id, ek).unwrap();
+
+        assert_eq!(db.user_email().as_str(), "alex@icloud.com");
+
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn restore_session_nonexistent_user_fails() {
+        let db = open_test_db();
+        let fake_id = UserId::new("nonexistent-user-id".to_string());
+        let fake_ek = types::EncryptionKey::new("0".repeat(64));
+
+        assert!(db.restore_session(fake_id, fake_ek).is_err());
+    }
 }

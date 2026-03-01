@@ -74,3 +74,103 @@ pub fn decode_access_token_allow_expired(
     .map_err(|e| JwtError::Decode(format!("JWT decode error: {:?}", e)))?;
     Ok(token_data.claims)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_secret() -> JwtSecret {
+        JwtSecret::new("test-secret-key-for-unit-tests".to_string())
+    }
+
+    fn test_user_id() -> UserId {
+        UserId::new("user-123".to_string())
+    }
+
+    fn test_email() -> Email {
+        Email::new("test@example.com".to_string())
+    }
+
+    fn test_encryption_key() -> EncryptionKey {
+        EncryptionKey::new("abcdef0123456789".to_string())
+    }
+
+    /// Создаёт токен с произвольным exp (для тестов expiration)
+    fn create_token_with_exp(exp: usize, secret: &JwtSecret) -> String {
+        let claims = Claims {
+            sub: "user-123".to_string(),
+            email: "test@example.com".to_string(),
+            ek: "abcdef0123456789".to_string(),
+            exp,
+        };
+        encode(
+            &Header::default(),
+            &claims,
+            &EncodingKey::from_secret(secret.as_str().as_bytes()),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn create_and_decode_roundtrip() {
+        let secret = test_secret();
+        let token = create_access_token(
+            &test_user_id(),
+            &test_email(),
+            &test_encryption_key(),
+            &secret,
+        )
+        .unwrap();
+
+        let claims = decode_access_token(&token, &secret).unwrap();
+
+        assert_eq!(claims.sub, "user-123");
+        assert_eq!(claims.email, "test@example.com");
+        assert_eq!(claims.ek, "abcdef0123456789");
+    }
+
+    #[test]
+    fn decode_rejects_wrong_secret() {
+        let secret = test_secret();
+        let wrong_secret = JwtSecret::new("wrong-secret".to_string());
+
+        let token = create_access_token(
+            &test_user_id(),
+            &test_email(),
+            &test_encryption_key(),
+            &secret,
+        )
+        .unwrap();
+
+        assert!(decode_access_token(&token, &wrong_secret).is_err());
+    }
+
+    #[test]
+    fn decode_rejects_expired_token() {
+        let secret = test_secret();
+        // exp = 0 → 1970-01-01, давно истёк
+        let token = create_token_with_exp(0, &secret);
+
+        assert!(decode_access_token(&token, &secret).is_err());
+    }
+
+    #[test]
+    fn decode_allow_expired_accepts_expired() {
+        let secret = test_secret();
+        let token = create_token_with_exp(0, &secret);
+
+        let claims = decode_access_token_allow_expired(&token, &secret).unwrap();
+
+        assert_eq!(claims.sub, "user-123");
+        assert_eq!(claims.ek, "abcdef0123456789");
+    }
+
+    #[test]
+    fn decode_allow_expired_rejects_wrong_secret() {
+        let secret = test_secret();
+        let wrong_secret = JwtSecret::new("wrong-secret".to_string());
+        let token = create_token_with_exp(0, &secret);
+
+        assert!(decode_access_token_allow_expired(&token, &wrong_secret).is_err());
+    }
+}
