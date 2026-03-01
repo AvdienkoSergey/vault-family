@@ -5,7 +5,8 @@ use chrono::Utc;
 use rusqlite::Connection;
 use std::marker::PhantomData;
 use types::{
-    AuthSession, Email, EncryptedEntry, EntryId, MasterPassword, PlainEntry, User, UserId,
+    AuthSession, Email, EncryptedEntry, EntryId, MasterPassword, PlainEntry, RefreshTokenHash,
+    User, UserId,
 };
 use uuid::Uuid;
 mod sealed {
@@ -97,6 +98,11 @@ impl<C: CryptoProvider> DB<Closed, C> {
                 nonce           TEXT NOT NULL,
                 created_at      TEXT NOT NULL,
                 updated_at      TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS refresh_tokens (
+                token_hash      TEXT PRIMARY KEY,
+                user_id         TEXT NOT NULL,
+                expires_at      TEXT NOT NULL
             );
             COMMIT;",
         );
@@ -196,12 +202,88 @@ impl<C: CryptoProvider> DB<Open, C> {
             return Err(VaultError::Auth("Invalid master password".to_string()));
         }
         let key = crypto.derive_encryption_key(&master_password, &user.encryption_salt);
+        let session_user = types::SessionUser {
+            id: user.id,
+            email: user.email,
+        };
         Ok(DB {
             conn,
-            session: AuthSession { user, key },
+            session: AuthSession {
+                user: session_user,
+                key,
+            },
             crypto,
             _state: PhantomData,
         })
+    }
+    /// Open → Authenticated БЕЗ проверки пароля.
+    /// JWT уже доказал что пользователь аутентифицирован —
+    /// восстанавливаем сессию из проверенных claims.
+    pub fn restore_session(
+        self,
+        user_id: UserId,
+        encryption_key: types::EncryptionKey,
+    ) -> Result<DB<Authenticated, C>, VaultError> {
+        let conn = self.conn;
+        let user = {
+            let mut stmt = conn
+                .prepare("SELECT id, email FROM users WHERE id = ?1")
+                .map_err(|e| VaultError::Database(format!("Failed to prepare statement: {e}")))?;
+            stmt.query_row(rusqlite::params![user_id.as_str()], |row| {
+                Ok(types::SessionUser {
+                    id: UserId::new(row.get(0)?),
+                    email: Email::new(row.get(1)?),
+                })
+            })
+            .map_err(|e| VaultError::Database(format!("User not found: {e}")))?
+        };
+        Ok(DB {
+            conn,
+            session: AuthSession {
+                user,
+                key: encryption_key,
+            },
+            crypto: self.crypto,
+            _state: PhantomData,
+        })
+    }
+    /// Проверить refresh-токен и удалить (rotation).
+    /// Возвращает user_id владельца токена.
+    pub fn verify_and_delete_refresh_token(
+        &self,
+        token_hash: &RefreshTokenHash,
+    ) -> Result<UserId, VaultError> {
+        let (user_id, expires_at): (String, String) = self
+            .conn
+            .query_row(
+                "SELECT user_id, expires_at FROM refresh_tokens WHERE token_hash = ?1",
+                rusqlite::params![token_hash.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .map_err(|_| VaultError::Auth("Refresh token not found".to_string()))?;
+
+        let expires = expires_at
+            .parse::<chrono::DateTime<Utc>>()
+            .map_err(|e| VaultError::Database(format!("Invalid expires_at: {e}")))?;
+
+        if expires < Utc::now() {
+            // Удаляем протухший токен
+            let _ = self.conn.execute(
+                "DELETE FROM refresh_tokens WHERE token_hash = ?1",
+                rusqlite::params![token_hash.as_str()],
+            );
+            return Err(VaultError::Auth("Refresh token expired".to_string()));
+        }
+
+        // Rotation: удаляем использованный токен
+        self.conn
+            .execute(
+                "DELETE FROM refresh_tokens WHERE token_hash = ?1",
+                rusqlite::params![token_hash.as_str()],
+            )
+            .map_err(|e| VaultError::Database(format!("Failed to delete refresh token: {e}")))?;
+
+        Ok(UserId::new(user_id))
     }
 }
 /// Authenticated: работа с записями
@@ -300,6 +382,28 @@ impl<C: CryptoProvider> DB<Authenticated, C> {
     /// Accessor-метод для доступа к приватному полю session.user.email
     pub fn user_email(&self) -> &Email {
         &self.session.user.email
+    }
+    /// Ссылка на encryption key сессии
+    pub fn encryption_key(&self) -> &types::EncryptionKey {
+        &self.session.key
+    }
+    /// Сохранить хеш refresh-токена в БД
+    pub fn save_refresh_token(
+        &self,
+        token_hash: &RefreshTokenHash,
+        expires_at: chrono::DateTime<Utc>,
+    ) -> Result<(), VaultError> {
+        self.conn
+            .execute(
+                "INSERT INTO refresh_tokens (token_hash, user_id, expires_at) VALUES (?1, ?2, ?3)",
+                rusqlite::params![
+                    token_hash.as_str(),
+                    self.session.user.id.as_str(),
+                    expires_at.to_rfc3339(),
+                ],
+            )
+            .map_err(|e| VaultError::Database(format!("Failed to save refresh token: {e}")))?;
+        Ok(())
     }
 }
 
@@ -475,5 +579,120 @@ mod tests {
             MasterPassword::new("WrongPassword!".to_string()),
         );
         assert!(result.is_err());
+    }
+
+    // ════════════════════════════════════════════
+    // Refresh tokens
+    // ════════════════════════════════════════════
+
+    /// Вставить refresh token напрямую через SQL (для тестов verify на DB<Open>)
+    fn insert_refresh_token(
+        db: &DB<Open, FakeCrypto>,
+        token_hash: &str,
+        user_id: &str,
+        expires_at: chrono::DateTime<Utc>,
+    ) {
+        db.conn
+            .execute(
+                "INSERT INTO refresh_tokens (token_hash, user_id, expires_at) VALUES (?1, ?2, ?3)",
+                rusqlite::params![token_hash, user_id, expires_at.to_rfc3339()],
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn save_and_verify_refresh_token() {
+        let db = open_test_db();
+        db.create_user(
+            Email::new("alex@icloud.com".to_string()),
+            MasterPassword::new("SuperSecret123!".to_string()),
+        )
+        .unwrap();
+
+        let hash = RefreshTokenHash::new("abc123hash".to_string());
+        let expires_at = Utc::now() + chrono::Duration::hours(1);
+        insert_refresh_token(&db, "abc123hash", "user-1", expires_at);
+
+        let user_id = db.verify_and_delete_refresh_token(&hash).unwrap();
+        assert_eq!(user_id.as_str(), "user-1");
+    }
+
+    #[test]
+    fn verify_deletes_token() {
+        let db = open_test_db();
+        let hash = RefreshTokenHash::new("abc123hash".to_string());
+        let expires_at = Utc::now() + chrono::Duration::hours(1);
+        insert_refresh_token(&db, "abc123hash", "user-1", expires_at);
+
+        db.verify_and_delete_refresh_token(&hash).unwrap();
+
+        // Повторный вызов — токен уже удалён (rotation)
+        assert!(db.verify_and_delete_refresh_token(&hash).is_err());
+    }
+
+    #[test]
+    fn verify_expired_token_fails() {
+        let db = open_test_db();
+        let hash = RefreshTokenHash::new("expired-hash".to_string());
+        let expires_at = Utc::now() - chrono::Duration::hours(1); // в прошлом
+        insert_refresh_token(&db, "expired-hash", "user-1", expires_at);
+
+        assert!(db.verify_and_delete_refresh_token(&hash).is_err());
+    }
+
+    #[test]
+    fn verify_nonexistent_token_fails() {
+        let db = open_test_db();
+        let hash = RefreshTokenHash::new("does-not-exist".to_string());
+
+        assert!(db.verify_and_delete_refresh_token(&hash).is_err());
+    }
+
+    // ════════════════════════════════════════════
+    // restore_session
+    // ════════════════════════════════════════════
+
+    #[test]
+    fn restore_session_works() {
+        let tmp = std::env::temp_dir().join("vault_test_restore.db");
+        let _ = std::fs::remove_file(&tmp); // clean slate
+
+        // 1. Создаём юзера и аутентифицируемся
+        let db = DB::<Closed, FakeCrypto>::new(FakeCrypto)
+            .open(tmp.to_str().unwrap())
+            .unwrap();
+        db.create_user(
+            Email::new("alex@icloud.com".to_string()),
+            MasterPassword::new("SuperSecret123!".to_string()),
+        )
+        .unwrap();
+        let auth_db = db
+            .authenticate(
+                Email::new("alex@icloud.com".to_string()),
+                MasterPassword::new("SuperSecret123!".to_string()),
+            )
+            .unwrap();
+        let user_id = UserId::new(auth_db.user_id().as_str().to_string());
+        let ek = types::EncryptionKey::new(auth_db.encryption_key().as_str().to_string());
+        drop(auth_db);
+
+        // 2. Новое соединение — restore_session без пароля
+        let db = DB::<Closed, FakeCrypto>::new(FakeCrypto)
+            .open(tmp.to_str().unwrap())
+            .unwrap();
+        let db = db.restore_session(user_id, ek).unwrap();
+
+        assert_eq!(db.user_email().as_str(), "alex@icloud.com");
+
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn restore_session_nonexistent_user_fails() {
+        let db = open_test_db();
+        let fake_id = UserId::new("nonexistent-user-id".to_string());
+        let fake_ek = types::EncryptionKey::new("0".repeat(64));
+
+        assert!(db.restore_session(fake_id, fake_ek).is_err());
     }
 }

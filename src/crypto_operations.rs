@@ -65,8 +65,10 @@ pub trait CryptoProvider {
     fn generate_salt(&self) -> EncryptionSalt;
 }
 
+#[derive(Clone)]
 pub struct RealCrypto; // PBKDF2 + AES-256-GCM
 #[cfg(test)]
+#[derive(Clone)]
 pub struct FakeCrypto; // заглушка для тестов
 
 impl CryptoProvider for RealCrypto {
