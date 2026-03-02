@@ -5,36 +5,42 @@ use serde::{Deserialize, Serialize};
 // ════════════════════════════════════════════════════════════════════
 
 #[derive(Deserialize)]
+#[cfg_attr(feature = "swagger", derive(utoipa::ToSchema))]
 pub struct RegisterRequest {
     pub email: String,
     pub master_password: String,
 }
 
 #[derive(Serialize)]
+#[cfg_attr(feature = "swagger", derive(utoipa::ToSchema))]
 pub struct RegisterResponse {
     pub user_id: String,
     pub message: String,
 }
 
 #[derive(Deserialize)]
+#[cfg_attr(feature = "swagger", derive(utoipa::ToSchema))]
 pub struct LoginRequest {
     pub email: String,
     pub master_password: String,
 }
 
 #[derive(Serialize)]
+#[cfg_attr(feature = "swagger", derive(utoipa::ToSchema))]
 pub struct LoginResponse {
     pub access_token: String,
     pub refresh_token: String,
 }
 
 #[derive(Deserialize)]
+#[cfg_attr(feature = "swagger", derive(utoipa::ToSchema))]
 pub struct RefreshRequest {
     pub refresh_token: String,
     pub access_token: String,
 }
 
 #[derive(Serialize)]
+#[cfg_attr(feature = "swagger", derive(utoipa::ToSchema))]
 pub struct LogoutResponse {
     pub message: String,
 }
@@ -44,6 +50,7 @@ pub struct LogoutResponse {
 // ════════════════════════════════════════════════════════════════════
 
 #[derive(Deserialize)]
+#[cfg_attr(feature = "swagger", derive(utoipa::ToSchema))]
 pub struct AddRequest {
     pub service_name: String,
     pub service_url: String,
@@ -53,12 +60,14 @@ pub struct AddRequest {
 }
 
 #[derive(Serialize)]
+#[cfg_attr(feature = "swagger", derive(utoipa::ToSchema))]
 pub struct AddResponse {
     pub entry_id: String,
     pub message: String,
 }
 
 #[derive(Serialize)]
+#[cfg_attr(feature = "swagger", derive(utoipa::ToSchema))]
 pub struct ListEntry {
     pub entry_id: String,
     pub service_name: String,
@@ -66,6 +75,7 @@ pub struct ListEntry {
 }
 
 #[derive(Serialize)]
+#[cfg_attr(feature = "swagger", derive(utoipa::ToSchema))]
 pub struct ViewResponse {
     pub entry_id: String,
     pub service_name: String,
@@ -78,6 +88,7 @@ pub struct ViewResponse {
 }
 
 #[derive(Serialize)]
+#[cfg_attr(feature = "swagger", derive(utoipa::ToSchema))]
 pub struct DeleteResponse {
     pub message: String,
 }
@@ -87,17 +98,20 @@ pub struct DeleteResponse {
 // ════════════════════════════════════════════════════════════════════
 
 #[derive(Deserialize)]
+#[cfg_attr(feature = "swagger", derive(utoipa::ToSchema))]
 pub struct CreateSharedVaultRequest {
     pub name: String,
 }
 
 #[derive(Serialize)]
+#[cfg_attr(feature = "swagger", derive(utoipa::ToSchema))]
 pub struct CreateSharedVaultResponse {
     pub vault_id: String,
     pub message: String,
 }
 
 #[derive(Serialize)]
+#[cfg_attr(feature = "swagger", derive(utoipa::ToSchema))]
 pub struct SharedVaultListItem {
     pub vault_id: String,
     pub name: String,
@@ -106,22 +120,26 @@ pub struct SharedVaultListItem {
 }
 
 #[derive(Deserialize)]
+#[cfg_attr(feature = "swagger", derive(utoipa::ToSchema))]
 pub struct InviteMemberRequest {
     pub email: String,
     pub permission: String,
 }
 
 #[derive(Serialize)]
+#[cfg_attr(feature = "swagger", derive(utoipa::ToSchema))]
 pub struct InviteMemberResponse {
     pub message: String,
 }
 
 #[derive(Deserialize)]
+#[cfg_attr(feature = "swagger", derive(utoipa::ToSchema))]
 pub struct UpdatePermissionRequest {
     pub permission: String,
 }
 
 #[derive(Serialize)]
+#[cfg_attr(feature = "swagger", derive(utoipa::ToSchema))]
 pub struct SharedEntryListItem {
     pub entry_id: String,
     pub service_name: String,
@@ -129,6 +147,7 @@ pub struct SharedEntryListItem {
 }
 
 #[derive(Serialize)]
+#[cfg_attr(feature = "swagger", derive(utoipa::ToSchema))]
 pub struct MemberListItem {
     pub user_id: String,
     pub permission: String,
@@ -140,6 +159,7 @@ pub struct MemberListItem {
 // ════════════════════════════════════════════════════════════════════
 
 #[derive(Deserialize)]
+#[cfg_attr(feature = "swagger", derive(utoipa::ToSchema, utoipa::IntoParams))]
 pub struct GenerateParams {
     #[serde(default = "default_length")]
     pub length: usize,
@@ -162,6 +182,7 @@ fn default_true() -> bool {
 }
 
 #[derive(Serialize)]
+#[cfg_attr(feature = "swagger", derive(utoipa::ToSchema))]
 pub struct GenerateResponse {
     pub password: String,
 }

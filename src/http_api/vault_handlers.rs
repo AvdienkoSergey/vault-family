@@ -13,6 +13,17 @@ use uuid::Uuid;
 /// POST /add
 ///
 /// Вахтер (guard) → Пропуск (VaultPass) → Хранилище (vault CRUD)
+#[cfg_attr(feature = "swagger", utoipa::path(
+    post,
+    path = "/add",
+    tag = "Vault",
+    security(("bearer_jwt" = [])),
+    request_body = AddRequest,
+    responses(
+        (status = 200, description = "Entry added", body = AddResponse),
+        (status = 401, description = "Not authenticated")
+    )
+))]
 pub async fn add_handler<C: CryptoProvider + Clone + Send + Sync + 'static>(
     State(state): State<AppState<C>>,
     headers: axum::http::HeaderMap,
@@ -69,6 +80,16 @@ pub async fn add_handler<C: CryptoProvider + Clone + Send + Sync + 'static>(
 /// GET /list
 ///
 /// Вахтер (guard) → Пропуск → Хранилище (list_entries)
+#[cfg_attr(feature = "swagger", utoipa::path(
+    get,
+    path = "/list",
+    tag = "Vault",
+    security(("bearer_jwt" = [])),
+    responses(
+        (status = 200, description = "List of entries", body = Vec<ListEntry>),
+        (status = 401, description = "Not authenticated")
+    )
+))]
 pub async fn list_handler<C: CryptoProvider + Clone + Send + Sync + 'static>(
     State(state): State<AppState<C>>,
     headers: axum::http::HeaderMap,
@@ -116,6 +137,18 @@ pub async fn list_handler<C: CryptoProvider + Clone + Send + Sync + 'static>(
 /// GET /view/{id}
 ///
 /// Вахтер (guard) → Пропуск → Хранилище (decrypt entry)
+#[cfg_attr(feature = "swagger", utoipa::path(
+    get,
+    path = "/view/{id}",
+    tag = "Vault",
+    security(("bearer_jwt" = [])),
+    params(("id" = String, Path, description = "Entry ID")),
+    responses(
+        (status = 200, description = "Entry details", body = ViewResponse),
+        (status = 401, description = "Not authenticated"),
+        (status = 404, description = "Entry not found")
+    )
+))]
 pub async fn view_handler<C: CryptoProvider + Clone + Send + Sync + 'static>(
     State(state): State<AppState<C>>,
     headers: axum::http::HeaderMap,
@@ -170,6 +203,18 @@ pub async fn view_handler<C: CryptoProvider + Clone + Send + Sync + 'static>(
 /// DELETE /delete/{id}
 ///
 /// Вахтер (guard) → Пропуск → Хранилище (delete_entry)
+#[cfg_attr(feature = "swagger", utoipa::path(
+    delete,
+    path = "/delete/{id}",
+    tag = "Vault",
+    security(("bearer_jwt" = [])),
+    params(("id" = String, Path, description = "Entry ID")),
+    responses(
+        (status = 200, description = "Entry deleted", body = DeleteResponse),
+        (status = 401, description = "Not authenticated"),
+        (status = 404, description = "Entry not found")
+    )
+))]
 pub async fn delete_handler<C: CryptoProvider + Clone + Send + Sync + 'static>(
     State(state): State<AppState<C>>,
     headers: axum::http::HeaderMap,

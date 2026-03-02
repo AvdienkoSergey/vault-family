@@ -46,6 +46,24 @@ jobs:
           components: rustfmt
       - run: cargo fmt --check
 
+  check-swagger:
+    name: cargo check --features swagger
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo check --features swagger
+
+  clippy-swagger:
+    name: cargo clippy --features swagger
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - run: cargo clippy --features swagger -- -D warnings
+
   file-stats:
     name: file stats
     runs-on: ubuntu-latest

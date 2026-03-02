@@ -29,6 +29,17 @@ fn shared_error_to_status(err: &SharedError) -> StatusCode {
 }
 
 /// POST /shared-vaults
+#[cfg_attr(feature = "swagger", utoipa::path(
+    post,
+    path = "/shared-vaults",
+    tag = "Shared Vaults",
+    security(("bearer_jwt" = [])),
+    request_body = CreateSharedVaultRequest,
+    responses(
+        (status = 200, description = "Shared vault created", body = CreateSharedVaultResponse),
+        (status = 401, description = "Not authenticated")
+    )
+))]
 pub async fn create_shared_vault_handler<C: CryptoProvider + Clone + Send + Sync + 'static>(
     State(state): State<AppState<C>>,
     headers: axum::http::HeaderMap,
@@ -59,6 +70,16 @@ pub async fn create_shared_vault_handler<C: CryptoProvider + Clone + Send + Sync
 }
 
 /// GET /shared-vaults
+#[cfg_attr(feature = "swagger", utoipa::path(
+    get,
+    path = "/shared-vaults",
+    tag = "Shared Vaults",
+    security(("bearer_jwt" = [])),
+    responses(
+        (status = 200, description = "List of shared vaults", body = Vec<SharedVaultListItem>),
+        (status = 401, description = "Not authenticated")
+    )
+))]
 pub async fn list_shared_vaults_handler<C: CryptoProvider + Clone + Send + Sync + 'static>(
     State(state): State<AppState<C>>,
     headers: axum::http::HeaderMap,
@@ -95,6 +116,19 @@ pub async fn list_shared_vaults_handler<C: CryptoProvider + Clone + Send + Sync 
 }
 
 /// DELETE /shared-vaults/{vault_id}
+#[cfg_attr(feature = "swagger", utoipa::path(
+    delete,
+    path = "/shared-vaults/{vault_id}",
+    tag = "Shared Vaults",
+    security(("bearer_jwt" = [])),
+    params(("vault_id" = String, Path, description = "Shared vault ID")),
+    responses(
+        (status = 200, description = "Shared vault deleted", body = DeleteResponse),
+        (status = 401, description = "Not authenticated"),
+        (status = 403, description = "Not the owner"),
+        (status = 404, description = "Vault not found")
+    )
+))]
 pub async fn delete_shared_vault_handler<C: CryptoProvider + Clone + Send + Sync + 'static>(
     State(state): State<AppState<C>>,
     headers: axum::http::HeaderMap,
@@ -124,6 +158,21 @@ pub async fn delete_shared_vault_handler<C: CryptoProvider + Clone + Send + Sync
 }
 
 /// POST /shared-vaults/{vault_id}/invite
+#[cfg_attr(feature = "swagger", utoipa::path(
+    post,
+    path = "/shared-vaults/{vault_id}/invite",
+    tag = "Shared Vaults - Members",
+    security(("bearer_jwt" = [])),
+    params(("vault_id" = String, Path, description = "Shared vault ID")),
+    request_body = InviteMemberRequest,
+    responses(
+        (status = 200, description = "Member invited", body = InviteMemberResponse),
+        (status = 400, description = "Invalid email or permission"),
+        (status = 401, description = "Not authenticated"),
+        (status = 403, description = "Not the owner"),
+        (status = 404, description = "User not found")
+    )
+))]
 pub async fn invite_member_handler<C: CryptoProvider + Clone + Send + Sync + 'static>(
     State(state): State<AppState<C>>,
     headers: axum::http::HeaderMap,
@@ -174,6 +223,22 @@ pub async fn invite_member_handler<C: CryptoProvider + Clone + Send + Sync + 'st
 }
 
 /// DELETE /shared-vaults/{vault_id}/members/{user_id}
+#[cfg_attr(feature = "swagger", utoipa::path(
+    delete,
+    path = "/shared-vaults/{vault_id}/members/{user_id}",
+    tag = "Shared Vaults - Members",
+    security(("bearer_jwt" = [])),
+    params(
+        ("vault_id" = String, Path, description = "Shared vault ID"),
+        ("user_id" = String, Path, description = "User ID to revoke"),
+    ),
+    responses(
+        (status = 200, description = "Member revoked", body = DeleteResponse),
+        (status = 401, description = "Not authenticated"),
+        (status = 403, description = "Not the owner"),
+        (status = 404, description = "Vault or member not found")
+    )
+))]
 pub async fn revoke_member_handler<C: CryptoProvider + Clone + Send + Sync + 'static>(
     State(state): State<AppState<C>>,
     headers: axum::http::HeaderMap,
@@ -203,6 +268,23 @@ pub async fn revoke_member_handler<C: CryptoProvider + Clone + Send + Sync + 'st
 }
 
 /// PATCH /shared-vaults/{vault_id}/members/{user_id}
+#[cfg_attr(feature = "swagger", utoipa::path(
+    patch,
+    path = "/shared-vaults/{vault_id}/members/{user_id}",
+    tag = "Shared Vaults - Members",
+    security(("bearer_jwt" = [])),
+    params(
+        ("vault_id" = String, Path, description = "Shared vault ID"),
+        ("user_id" = String, Path, description = "User ID to update"),
+    ),
+    request_body = UpdatePermissionRequest,
+    responses(
+        (status = 200, description = "Permission updated", body = InviteMemberResponse),
+        (status = 400, description = "Invalid permission"),
+        (status = 401, description = "Not authenticated"),
+        (status = 403, description = "Not the owner")
+    )
+))]
 pub async fn update_permission_handler<C: CryptoProvider + Clone + Send + Sync + 'static>(
     State(state): State<AppState<C>>,
     headers: axum::http::HeaderMap,
@@ -241,6 +323,18 @@ pub async fn update_permission_handler<C: CryptoProvider + Clone + Send + Sync +
 }
 
 /// GET /shared-vaults/{vault_id}/members
+#[cfg_attr(feature = "swagger", utoipa::path(
+    get,
+    path = "/shared-vaults/{vault_id}/members",
+    tag = "Shared Vaults - Members",
+    security(("bearer_jwt" = [])),
+    params(("vault_id" = String, Path, description = "Shared vault ID")),
+    responses(
+        (status = 200, description = "List of members", body = Vec<MemberListItem>),
+        (status = 401, description = "Not authenticated"),
+        (status = 403, description = "Not a member")
+    )
+))]
 pub async fn list_members_handler<C: CryptoProvider + Clone + Send + Sync + 'static>(
     State(state): State<AppState<C>>,
     headers: axum::http::HeaderMap,
@@ -277,6 +371,19 @@ pub async fn list_members_handler<C: CryptoProvider + Clone + Send + Sync + 'sta
 }
 
 /// POST /shared-vaults/{vault_id}/entries
+#[cfg_attr(feature = "swagger", utoipa::path(
+    post,
+    path = "/shared-vaults/{vault_id}/entries",
+    tag = "Shared Vaults - Entries",
+    security(("bearer_jwt" = [])),
+    params(("vault_id" = String, Path, description = "Shared vault ID")),
+    request_body = AddRequest,
+    responses(
+        (status = 200, description = "Shared entry added", body = AddResponse),
+        (status = 401, description = "Not authenticated"),
+        (status = 403, description = "No write permission")
+    )
+))]
 pub async fn add_shared_entry_handler<C: CryptoProvider + Clone + Send + Sync + 'static>(
     State(state): State<AppState<C>>,
     headers: axum::http::HeaderMap,
@@ -323,6 +430,18 @@ pub async fn add_shared_entry_handler<C: CryptoProvider + Clone + Send + Sync + 
 }
 
 /// GET /shared-vaults/{vault_id}/entries
+#[cfg_attr(feature = "swagger", utoipa::path(
+    get,
+    path = "/shared-vaults/{vault_id}/entries",
+    tag = "Shared Vaults - Entries",
+    security(("bearer_jwt" = [])),
+    params(("vault_id" = String, Path, description = "Shared vault ID")),
+    responses(
+        (status = 200, description = "List of shared entries", body = Vec<SharedEntryListItem>),
+        (status = 401, description = "Not authenticated"),
+        (status = 403, description = "Not a member")
+    )
+))]
 pub async fn list_shared_entries_handler<C: CryptoProvider + Clone + Send + Sync + 'static>(
     State(state): State<AppState<C>>,
     headers: axum::http::HeaderMap,
@@ -359,6 +478,22 @@ pub async fn list_shared_entries_handler<C: CryptoProvider + Clone + Send + Sync
 }
 
 /// GET /shared-vaults/{vault_id}/entries/{entry_id}
+#[cfg_attr(feature = "swagger", utoipa::path(
+    get,
+    path = "/shared-vaults/{vault_id}/entries/{entry_id}",
+    tag = "Shared Vaults - Entries",
+    security(("bearer_jwt" = [])),
+    params(
+        ("vault_id" = String, Path, description = "Shared vault ID"),
+        ("entry_id" = String, Path, description = "Entry ID"),
+    ),
+    responses(
+        (status = 200, description = "Shared entry details", body = ViewResponse),
+        (status = 401, description = "Not authenticated"),
+        (status = 403, description = "No read permission"),
+        (status = 404, description = "Entry not found")
+    )
+))]
 pub async fn view_shared_entry_handler<C: CryptoProvider + Clone + Send + Sync + 'static>(
     State(state): State<AppState<C>>,
     headers: axum::http::HeaderMap,
@@ -399,6 +534,22 @@ pub async fn view_shared_entry_handler<C: CryptoProvider + Clone + Send + Sync +
 }
 
 /// DELETE /shared-vaults/{vault_id}/entries/{entry_id}
+#[cfg_attr(feature = "swagger", utoipa::path(
+    delete,
+    path = "/shared-vaults/{vault_id}/entries/{entry_id}",
+    tag = "Shared Vaults - Entries",
+    security(("bearer_jwt" = [])),
+    params(
+        ("vault_id" = String, Path, description = "Shared vault ID"),
+        ("entry_id" = String, Path, description = "Entry ID"),
+    ),
+    responses(
+        (status = 200, description = "Shared entry deleted", body = DeleteResponse),
+        (status = 401, description = "Not authenticated"),
+        (status = 403, description = "No write permission"),
+        (status = 404, description = "Entry not found")
+    )
+))]
 pub async fn delete_shared_entry_handler<C: CryptoProvider + Clone + Send + Sync + 'static>(
     State(state): State<AppState<C>>,
     headers: axum::http::HeaderMap,
