@@ -139,10 +139,27 @@ pub fn guard(
 /// Определить путь к auth.db на основе пути к vault.db.
 ///
 /// `vault.db` → `auth.db` (в той же директории).
+/// Derive auth.db path from vault.db path (same directory, sibling file).
+///
+/// `data/vault.db` → `data/auth.db`
+/// `data/vault_test_abc.db` → `data/vault_test_abc_auth.db`
+///
+/// Uses the stem of vault_db_path to produce a unique sibling name.
+/// This ensures test isolation when multiple vault DBs exist in the same directory.
 pub fn auth_db_path(vault_db_path: &str) -> String {
     let path = std::path::Path::new(vault_db_path);
     let parent = path.parent().unwrap_or(std::path::Path::new("."));
-    parent.join("auth.db").to_string_lossy().into_owned()
+    let stem = path.file_stem().unwrap_or_default().to_string_lossy();
+    if stem == "vault" {
+        // Production convention: vault.db → auth.db
+        parent.join("auth.db").to_string_lossy().into_owned()
+    } else {
+        // Test / custom: vault_test_abc.db → vault_test_abc_auth.db
+        parent
+            .join(format!("{stem}_auth.db"))
+            .to_string_lossy()
+            .into_owned()
+    }
 }
 
 // ════════════════════════════════════════════════════════════════════
@@ -265,5 +282,12 @@ mod tests {
         let path = auth_db_path("/data/vault-family/vault.db");
         assert!(path.contains("auth.db"));
         assert!(path.contains("vault-family"));
+    }
+
+    #[test]
+    fn auth_db_path_unique_for_test_dbs() {
+        let path = auth_db_path("/tmp/vault_handler_test_abc123.db");
+        assert!(path.contains("vault_handler_test_abc123_auth.db"));
+        assert!(!path.ends_with("auth.db") || path.contains("abc123"));
     }
 }
