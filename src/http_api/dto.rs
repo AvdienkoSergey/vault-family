@@ -83,6 +83,59 @@ pub struct DeleteResponse {
 }
 
 // ════════════════════════════════════════════════════════════════════
+// Shared Vaults
+// ════════════════════════════════════════════════════════════════════
+
+#[derive(Deserialize)]
+pub struct CreateSharedVaultRequest {
+    pub name: String,
+}
+
+#[derive(Serialize)]
+pub struct CreateSharedVaultResponse {
+    pub vault_id: String,
+    pub message: String,
+}
+
+#[derive(Serialize)]
+pub struct SharedVaultListItem {
+    pub vault_id: String,
+    pub name: String,
+    pub owner_id: String,
+    pub created_at: String,
+}
+
+#[derive(Deserialize)]
+pub struct InviteMemberRequest {
+    pub email: String,
+    pub permission: String,
+}
+
+#[derive(Serialize)]
+pub struct InviteMemberResponse {
+    pub message: String,
+}
+
+#[derive(Deserialize)]
+pub struct UpdatePermissionRequest {
+    pub permission: String,
+}
+
+#[derive(Serialize)]
+pub struct SharedEntryListItem {
+    pub entry_id: String,
+    pub service_name: String,
+    pub created_at: String,
+}
+
+#[derive(Serialize)]
+pub struct MemberListItem {
+    pub user_id: String,
+    pub permission: String,
+    pub invited_at: String,
+}
+
+// ════════════════════════════════════════════════════════════════════
 // Generate
 // ════════════════════════════════════════════════════════════════════
 

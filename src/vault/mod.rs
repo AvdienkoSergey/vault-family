@@ -244,6 +244,21 @@ impl<C: CryptoProvider> DB<Open, C> {
         Ok(VaultPass::new(user.id, user.email, key))
     }
 
+    /// Look up user by email → UserId (needed for invite by email in shared vaults).
+    /// Read-only query, does not require authentication.
+    pub fn find_user_id_by_email(&self, email: &Email) -> Result<UserId, VaultError> {
+        self.conn
+            .query_row(
+                "SELECT id FROM users WHERE email = ?1",
+                rusqlite::params![email.as_str()],
+                |row| {
+                    let id: String = row.get(0)?;
+                    Ok(UserId::new(id))
+                },
+            )
+            .map_err(|e| VaultError::Database(format!("User not found: {e}")))
+    }
+
     /// Войти в Хранилище с Пропуском.
     ///
     /// **Потребляет self** — DB переходит в Authenticated.
@@ -709,6 +724,33 @@ mod tests {
         let nastya_fake_id = UserId::new("nastya-fake-id".to_string());
         let nastya_entries = db.list_entries(&nastya_fake_id).expect("Failed to list");
         assert_eq!(nastya_entries.len(), 0);
+    }
+
+    // ════════════════════════════════════════════
+    // find_user_id_by_email
+    // ════════════════════════════════════════════
+
+    #[test]
+    fn find_user_id_by_email_existing() {
+        let db = open_test_db();
+        let user = db
+            .create_user(
+                Email::new("alex@icloud.com".to_string()),
+                MasterPassword::new("SuperSecret123!".to_string()),
+            )
+            .unwrap();
+
+        let found = db
+            .find_user_id_by_email(&Email::new("alex@icloud.com".to_string()))
+            .unwrap();
+        assert_eq!(found.as_str(), user.id.as_str());
+    }
+
+    #[test]
+    fn find_user_id_by_email_not_found() {
+        let db = open_test_db();
+        let result = db.find_user_id_by_email(&Email::new("nobody@example.com".to_string()));
+        assert!(result.is_err());
     }
 
     // ════════════════════════════════════════════

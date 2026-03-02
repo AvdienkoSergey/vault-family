@@ -87,4 +87,46 @@ impl CryptoProvider for FakeCrypto {
     fn generate_salt(&self) -> EncryptionSalt {
         EncryptionSalt::new("fake_enc_salt_16".to_string())
     }
+
+    // ── X25519 + raw AES-GCM fakes (для shared vault тестов) ──
+
+    fn generate_x25519_keypair(&self) -> (String, String) {
+        // Deterministic fake: 32-byte hex keys
+        (
+            "aa".repeat(32), // public key: 64 hex chars
+            "bb".repeat(32), // private key: 64 hex chars
+        )
+    }
+
+    fn encrypt_raw(
+        &self,
+        plaintext: &[u8],
+        key_hex: &str,
+    ) -> Result<(String, String), CryptoError> {
+        assert!(!key_hex.is_empty(), "Key must not be empty");
+        // Fake: just hex-encode the plaintext (no actual encryption)
+        Ok((hex::encode(plaintext), "fake_raw_nonce".to_string()))
+    }
+
+    fn decrypt_raw(
+        &self,
+        ciphertext_hex: &str,
+        _nonce_hex: &str,
+        key_hex: &str,
+    ) -> Result<Vec<u8>, CryptoError> {
+        assert!(!key_hex.is_empty(), "Key must not be empty");
+        // Fake: just hex-decode back
+        hex::decode(ciphertext_hex).map_err(|e| CryptoError::InvalidData(e.to_string()))
+    }
+
+    fn x25519_derive_shared_key(
+        &self,
+        private_key_hex: &str,
+        public_key_hex: &str,
+    ) -> Result<String, CryptoError> {
+        // Deterministic fake: SHA-256(private || public) → 64-char hex
+        use sha2::{Digest, Sha256};
+        let combined = format!("{}{}", private_key_hex, public_key_hex);
+        Ok(hex::encode(Sha256::digest(combined.as_bytes())))
+    }
 }

@@ -1,6 +1,7 @@
 mod auth_handlers;
 mod dto;
 mod handlers;
+mod shared_vault_handlers;
 mod vault_handlers;
 
 #[cfg(test)]
@@ -8,7 +9,7 @@ mod tests;
 
 use axum::Router;
 use axum::http::header::AUTHORIZATION;
-use axum::routing::{delete, get, post};
+use axum::routing::{delete, get, patch, post};
 use tokio::net::TcpListener;
 use tower_http::sensitive_headers::SetSensitiveRequestHeadersLayer;
 use tower_http::trace::{DefaultMakeSpan, DefaultOnRequest, DefaultOnResponse, TraceLayer};
@@ -20,9 +21,16 @@ use std::sync::Arc;
 use crate::auth;
 use crate::auth::{FailedLoginTracker, JwtSecret, SessionStore};
 use crate::crypto_operations::{CryptoProvider, RealCrypto};
+use crate::shared;
 
 use auth_handlers::{login_handler, logout_handler, refresh_handler, register_handler};
 use handlers::{generate_handler, health_handler};
+use shared_vault_handlers::{
+    add_shared_entry_handler, create_shared_vault_handler, delete_shared_entry_handler,
+    delete_shared_vault_handler, invite_member_handler, list_members_handler,
+    list_shared_entries_handler, list_shared_vaults_handler, revoke_member_handler,
+    update_permission_handler, view_shared_entry_handler,
+};
 use vault_handlers::{add_handler, delete_handler, list_handler, view_handler};
 
 // ════════════════════════════════════════════════════════════════════
@@ -54,6 +62,8 @@ pub(crate) struct AppState<C: CryptoProvider + Clone> {
     pub(crate) db_path: String,
     /// Путь к auth.db (refresh-токены)
     pub(crate) auth_db_path: String,
+    /// Путь к shared.db (shared vaults)
+    pub(crate) shared_db_path: String,
     /// JWT-секрет для подписи токенов
     pub(crate) jwt_secret: Arc<JwtSecret>,
     /// Серверное хранилище сессий (EncryptionKey в памяти, не в JWT)
@@ -75,6 +85,7 @@ pub async fn run_server(host: &str, port: u16, db_path: String) -> Result<(), Se
         .map_err(|e| ServerError::Connection(format!("Failed to load JWT secret: {e}")))?;
 
     let auth_db_path = auth::auth_db_path(&db_path);
+    let shared_db_path = shared::shared_db_path(&db_path);
 
     tracing_subscriber::fmt()
         .with_target(false)
@@ -96,6 +107,51 @@ pub async fn run_server(host: &str, port: u16, db_path: String) -> Result<(), Se
         .route("/view/{id}", get(view_handler::<RealCrypto>))
         .route("/delete/{id}", delete(delete_handler::<RealCrypto>))
         .route("/generate", get(generate_handler))
+        // Shared vaults
+        .route(
+            "/shared-vaults",
+            post(create_shared_vault_handler::<RealCrypto>),
+        )
+        .route(
+            "/shared-vaults",
+            get(list_shared_vaults_handler::<RealCrypto>),
+        )
+        .route(
+            "/shared-vaults/{vault_id}",
+            delete(delete_shared_vault_handler::<RealCrypto>),
+        )
+        .route(
+            "/shared-vaults/{vault_id}/invite",
+            post(invite_member_handler::<RealCrypto>),
+        )
+        .route(
+            "/shared-vaults/{vault_id}/members",
+            get(list_members_handler::<RealCrypto>),
+        )
+        .route(
+            "/shared-vaults/{vault_id}/members/{user_id}",
+            delete(revoke_member_handler::<RealCrypto>),
+        )
+        .route(
+            "/shared-vaults/{vault_id}/members/{user_id}",
+            patch(update_permission_handler::<RealCrypto>),
+        )
+        .route(
+            "/shared-vaults/{vault_id}/entries",
+            post(add_shared_entry_handler::<RealCrypto>),
+        )
+        .route(
+            "/shared-vaults/{vault_id}/entries",
+            get(list_shared_entries_handler::<RealCrypto>),
+        )
+        .route(
+            "/shared-vaults/{vault_id}/entries/{entry_id}",
+            get(view_shared_entry_handler::<RealCrypto>),
+        )
+        .route(
+            "/shared-vaults/{vault_id}/entries/{entry_id}",
+            delete(delete_shared_entry_handler::<RealCrypto>),
+        )
         .layer(
             TraceLayer::new_for_http()
                 .make_span_with(
@@ -110,6 +166,7 @@ pub async fn run_server(host: &str, port: u16, db_path: String) -> Result<(), Se
         .with_state(AppState {
             db_path,
             auth_db_path,
+            shared_db_path,
             jwt_secret: Arc::new(jwt_secret),
             session_store: SessionStore::new(),
             failed_login_tracker: FailedLoginTracker::new(),

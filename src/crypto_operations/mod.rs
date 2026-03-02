@@ -71,6 +71,30 @@ pub trait CryptoProvider {
         salt: &EncryptionSalt,
     ) -> EncryptionKey;
     fn generate_salt(&self) -> EncryptionSalt;
+
+    // ── X25519 + raw AES-GCM (для shared vaults) ──
+
+    /// Generate X25519 keypair. Returns (public_key_hex, private_key_hex).
+    fn generate_x25519_keypair(&self) -> (String, String);
+
+    /// Encrypt raw bytes with AES-256-GCM. Returns (ciphertext_hex, nonce_hex).
+    fn encrypt_raw(&self, plaintext: &[u8], key_hex: &str)
+    -> Result<(String, String), CryptoError>;
+
+    /// Decrypt raw bytes with AES-256-GCM.
+    fn decrypt_raw(
+        &self,
+        ciphertext_hex: &str,
+        nonce_hex: &str,
+        key_hex: &str,
+    ) -> Result<Vec<u8>, CryptoError>;
+
+    /// X25519 Diffie-Hellman → SHA-256 → AES-256 key (hex).
+    fn x25519_derive_shared_key(
+        &self,
+        private_key_hex: &str,
+        public_key_hex: &str,
+    ) -> Result<String, CryptoError>;
 }
 
 #[derive(Clone)]
@@ -214,5 +238,74 @@ impl CryptoProvider for RealCrypto {
     fn generate_salt(&self) -> EncryptionSalt {
         let bytes: [u8; 16] = rand::random();
         EncryptionSalt::new(hex::encode(bytes))
+    }
+
+    // ── X25519 + raw AES-GCM (для shared vaults) ──
+
+    fn generate_x25519_keypair(&self) -> (String, String) {
+        let secret_bytes: [u8; 32] = rand::random();
+        let secret = x25519_dalek::StaticSecret::from(secret_bytes);
+        let public = x25519_dalek::PublicKey::from(&secret);
+        (
+            hex::encode(public.as_bytes()),
+            hex::encode(secret.to_bytes()),
+        )
+    }
+
+    fn encrypt_raw(
+        &self,
+        plaintext: &[u8],
+        key_hex: &str,
+    ) -> Result<(String, String), CryptoError> {
+        let key_bytes = hex::decode(key_hex).map_err(|e| CryptoError::InvalidKey(e.to_string()))?;
+        let cipher = Aes256Gcm::new_from_slice(&key_bytes)
+            .map_err(|e| CryptoError::InvalidKey(e.to_string()))?;
+        let nonce = Aes256Gcm::generate_nonce(&mut aes_gcm::aead::OsRng);
+        let ciphertext = cipher
+            .encrypt(&nonce, plaintext)
+            .map_err(|e| CryptoError::EncryptionFailed(e.to_string()))?;
+        Ok((hex::encode(ciphertext), hex::encode(nonce)))
+    }
+
+    fn decrypt_raw(
+        &self,
+        ciphertext_hex: &str,
+        nonce_hex: &str,
+        key_hex: &str,
+    ) -> Result<Vec<u8>, CryptoError> {
+        let key_bytes = hex::decode(key_hex).map_err(|e| CryptoError::InvalidKey(e.to_string()))?;
+        let nonce_bytes = hex::decode(nonce_hex)
+            .map_err(|e| CryptoError::InvalidData(format!("invalid nonce hex: {e}")))?;
+        let ciphertext = hex::decode(ciphertext_hex)
+            .map_err(|e| CryptoError::InvalidData(format!("invalid ciphertext hex: {e}")))?;
+        let cipher = Aes256Gcm::new_from_slice(&key_bytes)
+            .map_err(|e| CryptoError::InvalidKey(e.to_string()))?;
+        let nonce = aes_gcm::Nonce::from_slice(&nonce_bytes);
+        cipher
+            .decrypt(nonce, ciphertext.as_ref())
+            .map_err(|e| CryptoError::DecryptionFailed(e.to_string()))
+    }
+
+    fn x25519_derive_shared_key(
+        &self,
+        private_key_hex: &str,
+        public_key_hex: &str,
+    ) -> Result<String, CryptoError> {
+        use sha2::Digest;
+        let priv_bytes: [u8; 32] = hex::decode(private_key_hex)
+            .map_err(|e| CryptoError::InvalidKey(e.to_string()))?
+            .try_into()
+            .map_err(|_| CryptoError::InvalidKey("private key must be 32 bytes".to_string()))?;
+        let pub_bytes: [u8; 32] = hex::decode(public_key_hex)
+            .map_err(|e| CryptoError::InvalidKey(e.to_string()))?
+            .try_into()
+            .map_err(|_| CryptoError::InvalidKey("public key must be 32 bytes".to_string()))?;
+
+        let secret = x25519_dalek::StaticSecret::from(priv_bytes);
+        let public = x25519_dalek::PublicKey::from(pub_bytes);
+        let shared = secret.diffie_hellman(&public);
+
+        let aes_key = Sha256::digest(shared.as_bytes());
+        Ok(hex::encode(aes_key))
     }
 }

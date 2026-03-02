@@ -5,6 +5,7 @@ use super::vault_handlers::{add_handler, delete_handler, list_handler, view_hand
 use crate::auth;
 use crate::auth::{FailedLoginTracker, JwtSecret, SessionStore};
 use crate::crypto_operations::FakeCrypto;
+use crate::shared;
 use axum::Router;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
@@ -22,6 +23,7 @@ struct TestApp {
     router: Router,
     db_path: String,
     auth_db_path: String,
+    shared_db_path: String,
 }
 
 impl TestApp {
@@ -33,10 +35,12 @@ impl TestApp {
             .to_string();
 
         let auth_db_path = auth::auth_db_path(&db_path);
+        let shared_db_path = shared::shared_db_path(&db_path);
 
         let state = AppState {
             db_path: db_path.clone(),
             auth_db_path: auth_db_path.clone(),
+            shared_db_path: shared_db_path.clone(),
             jwt_secret: Arc::new(JwtSecret::new("test-jwt-secret-for-handlers".to_string())),
             session_store: SessionStore::new(),
             failed_login_tracker: FailedLoginTracker::new(),
@@ -60,6 +64,7 @@ impl TestApp {
             router,
             db_path,
             auth_db_path,
+            shared_db_path,
         }
     }
 
@@ -72,6 +77,7 @@ impl Drop for TestApp {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.db_path);
         let _ = std::fs::remove_file(&self.auth_db_path);
+        let _ = std::fs::remove_file(&self.shared_db_path);
     }
 }
 

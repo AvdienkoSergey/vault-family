@@ -5,6 +5,7 @@ use super::dto::{
 use crate::auth;
 use crate::auth::{AuthStore, RefreshTokenHash, jwt_provider};
 use crate::crypto_operations::CryptoProvider;
+use crate::shared::SharedDB;
 use crate::types::{Email, EncryptionKey, MasterPassword};
 use crate::vault::{Closed, DB};
 use axum::Json;
@@ -25,6 +26,7 @@ pub async fn login_handler<C: CryptoProvider + Clone + Send + Sync + 'static>(
 ) -> Result<Json<LoginResponse>, StatusCode> {
     let db_path = state.db_path.clone();
     let auth_db_path = state.auth_db_path.clone();
+    let shared_db_path = state.shared_db_path.clone();
     let jwt_secret = state.jwt_secret.clone();
     let session_store = state.session_store.clone();
     let failed_login_tracker = state.failed_login_tracker.clone();
@@ -40,7 +42,7 @@ pub async fn login_handler<C: CryptoProvider + Clone + Send + Sync + 'static>(
         }
 
         // 1. Vault: проверяем пароль → VaultPass
-        let db = DB::<Closed, C>::new(crypto)
+        let db = DB::<Closed, C>::new(crypto.clone())
             .open(&db_path)
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
@@ -57,6 +59,14 @@ pub async fn login_handler<C: CryptoProvider + Clone + Send + Sync + 'static>(
             pass.user_id().as_str(),
             &EncryptionKey::new(pass.encryption_key().as_str().to_string()),
         );
+
+        // 2.5 Lazy keypair generation: ensure user has X25519 keypair for shared vaults
+        if let Ok(shared_db) = SharedDB::open(&shared_db_path, crypto) {
+            let has_kp = shared_db.has_user_keypair(pass.user_id()).unwrap_or(false);
+            if !has_kp {
+                let _ = shared_db.save_user_keypair(pass.user_id(), pass.encryption_key());
+            }
+        }
 
         // 3. JWT: access token из VaultPass (без ek в payload!)
         let access_token = jwt_provider::create_access_token_from_pass(&pass, &jwt_secret)
@@ -189,6 +199,9 @@ pub async fn logout_handler<C: CryptoProvider + Clone + Send + Sync + 'static>(
 }
 
 /// POST /register
+///
+/// X25519 keypair is NOT generated here — MasterPassword is consumed by create_user().
+/// Keypair is generated lazily at first login (see login_handler).
 pub async fn register_handler<C: CryptoProvider + Clone + Send + Sync + 'static>(
     State(state): State<AppState<C>>,
     Json(body): Json<RegisterRequest>,
