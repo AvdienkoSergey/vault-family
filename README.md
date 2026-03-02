@@ -856,17 +856,30 @@ base64 = "0.22"                                                          # Base6
 jsonwebtoken = { version = "10", features = ["rust_crypto"] }            # JWT encode/decode (HS256)
 ```
 
+## Dev-утилиты
+
+### file-stats — анализ размеров файлов
+
+Standalone Rust-утилита в `tools/file-stats/`. Выводит таблицу по каждому `.rs`-файлу: общее число строк, строки кода, строки тестов (`#[cfg(test)]`). Помогает принимать решения о разделении крупных файлов.
+
+```bash
+cargo run --manifest-path tools/file-stats/Cargo.toml
+```
+
+Файлы >300 строк помечаются `!` как кандидаты на рефакторинг.
+
 ## CI / CD
 
 ### CI
 
-На каждый PR и push в `main` запускаются 4 параллельных job:
+На каждый PR и push в `main` запускаются 5 параллельных job:
 
 ```
 cargo check    — компиляция
 cargo test     — тесты
 cargo clippy   — линтер (с -D warnings)
 cargo fmt      — форматирование
+file-stats     — soft check: таблица размеров файлов в логе (не блокирует PR)
 ```
 
 ### Релизы (release-please)
