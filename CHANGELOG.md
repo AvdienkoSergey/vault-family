@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.6](https://github.com/AvdienkoSergey/vault-family/compare/vault-family-v0.1.5...vault-family-v0.1.6) (2026-03-02)
+
+
+### Features
+
+* add shared vaults with X25519 key exchange ([d16bfab](https://github.com/AvdienkoSergey/vault-family/commit/d16bfab69e8e11f75767ac8b2a5bcf38b5d0609e))
+
 ## [0.1.5](https://github.com/AvdienkoSergey/vault-family/compare/vault-family-v0.1.4...vault-family-v0.1.5) (2026-03-01)
 
 
