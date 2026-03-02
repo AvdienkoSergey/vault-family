@@ -71,7 +71,10 @@ vault-family/
 │   │   └── mod.rs              #   DB typestate (Closed → Open → Authenticated)
 │   └── http_api/               # Тонкий HTTP слой (axum)
 │       ├── mod.rs              #   Router, AppState, run_server
-│       └── handlers.rs         #   Handler-функции для всех endpoints
+│       ├── dto.rs              #   Request/Response structs
+│       ├── auth_handlers.rs    #   login, register, refresh, logout
+│       ├── vault_handlers.rs   #   add, list, view, delete
+│       └── handlers.rs         #   health, generate (stateless)
 ```
 
 Проект разделён на library crate (`lib.rs`) и binary crate (`main.rs`).
