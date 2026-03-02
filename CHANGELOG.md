@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.1.7](https://github.com/AvdienkoSergey/vault-family/compare/vault-family-v0.1.6...vault-family-v0.1.7) (2026-03-02)
+
+
+### Bug Fixes
+
+* isolate auth.db per test to prevent SQLite BUSY races in CI ([a74bfd4](https://github.com/AvdienkoSergey/vault-family/commit/a74bfd450dca88ab920faf3ce8464a3453b77b28))
+* isolate auth.db per test to prevent SQLite BUSY races in CI ([072dcde](https://github.com/AvdienkoSergey/vault-family/commit/072dcde981a4d0905e226dc04dcbda3d788e8d22))
+
 ## [0.1.6](https://github.com/AvdienkoSergey/vault-family/compare/vault-family-v0.1.5...vault-family-v0.1.6) (2026-03-02)
 
 
