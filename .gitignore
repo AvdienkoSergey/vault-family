@@ -1,4 +1,4 @@
-/target/
+target/
 .idea/
 /.claude/
 /TECH_DEBT.md

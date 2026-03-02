@@ -56,7 +56,9 @@ vault-family/
 │   ├── lib.rs                  # Library crate: pub mod для всех модулей
 │   ├── main.rs                 # Binary crate: тонкая обёртка → cli::run()
 │   ├── types.rs                # Макросы branded types + VaultPass (Пропуск)
-│   ├── crypto_operations.rs    # CryptoProvider trait, RealCrypto, FakeCrypto
+│   ├── crypto_operations/      # Криптография
+│   │   ├── mod.rs              #   CryptoProvider trait, RealCrypto (PBKDF2 + AES-256-GCM)
+│   │   └── fake.rs             #   FakeCrypto — тестовая заглушка
 │   ├── password_generator.rs   # Генератор паролей с typestate (Empty → Ready)
 │   ├── cli.rs                  # CLI интерфейс (clap)
 │   ├── auth/                   # Guard — аутентификация и сессии
@@ -71,7 +73,10 @@ vault-family/
 │   │   └── mod.rs              #   DB typestate (Closed → Open → Authenticated)
 │   └── http_api/               # Тонкий HTTP слой (axum)
 │       ├── mod.rs              #   Router, AppState, run_server
-│       └── handlers.rs         #   Handler-функции для всех endpoints
+│       ├── dto.rs              #   Request/Response structs
+│       ├── auth_handlers.rs    #   login, register, refresh, logout
+│       ├── vault_handlers.rs   #   add, list, view, delete
+│       └── handlers.rs         #   health, generate (stateless)
 ```
 
 Проект разделён на library crate (`lib.rs`) и binary crate (`main.rs`).
@@ -856,17 +861,30 @@ base64 = "0.22"                                                          # Base6
 jsonwebtoken = { version = "10", features = ["rust_crypto"] }            # JWT encode/decode (HS256)
 ```
 
+## Dev-утилиты
+
+### file-stats — анализ размеров файлов
+
+Standalone Rust-утилита в `tools/file-stats/`. Выводит таблицу по каждому `.rs`-файлу: общее число строк, строки кода, строки тестов (`#[cfg(test)]`). Помогает принимать решения о разделении крупных файлов.
+
+```bash
+cargo run --manifest-path tools/file-stats/Cargo.toml
+```
+
+Файлы >300 строк помечаются `!` как кандидаты на рефакторинг.
+
 ## CI / CD
 
 ### CI
 
-На каждый PR и push в `main` запускаются 4 параллельных job:
+На каждый PR и push в `main` запускаются 5 параллельных job:
 
 ```
 cargo check    — компиляция
 cargo test     — тесты
 cargo clippy   — линтер (с -D warnings)
 cargo fmt      — форматирование
+file-stats     — soft check: таблица размеров файлов в логе (не блокирует PR)
 ```
 
 ### Релизы (release-please)

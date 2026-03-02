@@ -45,3 +45,11 @@ jobs:
         with:
           components: rustfmt
       - run: cargo fmt --check
+
+  file-stats:
+    name: file stats
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo run --manifest-path tools/file-stats/Cargo.toml

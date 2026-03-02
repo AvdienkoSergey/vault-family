@@ -1,4 +1,10 @@
+mod auth_handlers;
+mod dto;
 mod handlers;
+mod vault_handlers;
+
+#[cfg(test)]
+mod tests;
 
 use axum::Router;
 use axum::http::header::AUTHORIZATION;
@@ -15,10 +21,9 @@ use crate::auth;
 use crate::auth::{FailedLoginTracker, JwtSecret, SessionStore};
 use crate::crypto_operations::{CryptoProvider, RealCrypto};
 
-use handlers::{
-    add_handler, delete_handler, generate_handler, health_handler, list_handler, login_handler,
-    logout_handler, refresh_handler, register_handler, view_handler,
-};
+use auth_handlers::{login_handler, logout_handler, refresh_handler, register_handler};
+use handlers::{generate_handler, health_handler};
+use vault_handlers::{add_handler, delete_handler, list_handler, view_handler};
 
 // ════════════════════════════════════════════════════════════════════
 // Ошибки сервера
