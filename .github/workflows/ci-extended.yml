@@ -1,45 +1,35 @@
-name: CI
+name: CI Extended
 
 on:
-  pull_request:
+  push:
     branches: [main]
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  check:
-    name: cargo check
+  check-swagger:
+    name: cargo check --features swagger
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - run: cargo check
+      - run: cargo check --features swagger
 
-  test:
-    name: cargo test
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - run: cargo test
-
-  clippy:
-    name: cargo clippy
+  clippy-swagger:
+    name: cargo clippy --features swagger
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
-      - run: cargo clippy -- -D warnings
+      - run: cargo clippy --features swagger -- -D warnings
 
-  fmt:
-    name: cargo fmt
+  file-stats:
+    name: file stats
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt
-      - run: cargo fmt --check
+      - run: cargo run --manifest-path tools/file-stats/Cargo.toml
