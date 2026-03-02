@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.1.8](https://github.com/AvdienkoSergey/vault-family/compare/vault-family-v0.1.7...vault-family-v0.1.8) (2026-03-02)
+
+
+### Features
+
+* add swagger-ui in project ([7ac9106](https://github.com/AvdienkoSergey/vault-family/commit/7ac9106eeefc0d3434299c8d514fb5cf99d9f35e))
+* add swagger-ui in project ([0ac2588](https://github.com/AvdienkoSergey/vault-family/commit/0ac2588ad5ef52b7cb3036cd153d5204f71107b3))
+
 ## [0.1.7](https://github.com/AvdienkoSergey/vault-family/compare/vault-family-v0.1.6...vault-family-v0.1.7) (2026-03-02)
 
 
