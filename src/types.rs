@@ -179,6 +179,46 @@ branded_no_secret!(ServiceName); // "Hetzner Cloud"
 branded_no_secret!(ServiceUrl); // "https://console.hetzner.com"
 branded_secret!(Login); // логин на сервисе (email, username, телефон и т.д.)
 // ════════════════════════════════════════════════════════════════════
+// Branded types — привязаны к shared.db (модуль shared/)
+// ════════════════════════════════════════════════════════════════════
+// --- TABLE user_keys (shared.db) ---
+branded_no_secret!(UserPublicKey); // user_keys.public_key (X25519 public, hex)
+branded_no_secret!(UserPrivateKeyNonce); // user_keys.private_key_nonce
+// --- TABLE shared_vaults ---
+branded_no_secret!(SharedVaultId); // shared_vaults.id
+branded_no_secret!(SharedVaultName); // shared_vaults.name
+// --- TABLE shared_vault_members ---
+branded_no_secret!(SharedVaultKeyEncrypted); // encrypted SharedVaultKey per-member
+branded_no_secret!(SharedVaultKeyNonce); // nonce для расшифровки vault key
+branded_no_secret!(EphemeralPublicKey); // ephemeral X25519 public для DH
+// --- Вне БД: живут только в памяти (shared vault crypto) ---
+branded_secret!(SharedVaultKey); // расшифрованный 32-byte ключ shared vault
+branded_secret!(UserPrivateKey); // расшифрованный X25519 private key
+
+/// Права доступа участника в shared vault
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum VaultPermission {
+    Read,
+    ReadWrite,
+}
+
+impl VaultPermission {
+    pub fn as_str(&self) -> &str {
+        match self {
+            VaultPermission::Read => "read",
+            VaultPermission::ReadWrite => "readwrite",
+        }
+    }
+
+    pub fn from_str_permission(s: &str) -> Result<Self, String> {
+        match s {
+            "read" => Ok(VaultPermission::Read),
+            "readwrite" => Ok(VaultPermission::ReadWrite),
+            other => Err(format!("unknown permission: {other}")),
+        }
+    }
+}
+// ════════════════════════════════════════════════════════════════════
 //  Доменные структуры
 //════════════════════════════════════════════════════════════════════
 /// Пользователь — соответствует строке в TABLE users
@@ -232,6 +272,46 @@ pub struct SessionUser {
 pub struct AuthSession {
     pub user: SessionUser,
     pub key: EncryptionKey,
+}
+// ════════════════════════════════════════════════════════════════════
+// Доменные структуры — shared.db (модуль shared/)
+// ════════════════════════════════════════════════════════════════════
+/// Keypair пользователя — строка из TABLE user_keys (shared.db)
+#[derive(Debug)]
+pub struct UserKeyPair {
+    pub user_id: UserId,
+    pub public_key: UserPublicKey,
+    pub created_at: DateTime<Utc>,
+}
+
+/// Shared vault — строка из TABLE shared_vaults
+#[derive(Debug)]
+pub struct SharedVault {
+    pub id: SharedVaultId,
+    pub name: SharedVaultName,
+    pub owner_id: UserId,
+    pub created_at: DateTime<Utc>,
+}
+
+/// Участник shared vault — строка из TABLE shared_vault_members
+#[derive(Debug)]
+pub struct SharedVaultMember {
+    pub vault_id: SharedVaultId,
+    pub user_id: UserId,
+    pub permission: VaultPermission,
+    pub invited_at: DateTime<Utc>,
+}
+
+/// Зашифрованная запись в shared vault — строка из TABLE shared_entries
+#[derive(Debug, Clone)]
+pub struct SharedEncryptedEntry {
+    pub id: EntryId,
+    pub vault_id: SharedVaultId,
+    pub encrypted_data: EncryptedData,
+    pub nonce: Nonce,
+    pub created_by: UserId,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
 }
 // ════════════════════════════════════════════════════════════════════
 // VaultPass — Пропуск между Вахтером (auth) и Хранилищем (vault)
