@@ -3,6 +3,10 @@ name = "vault-family"
 version = "0.1.7"
 edition = "2024"
 
+[features]
+default = []
+swagger = ["dep:utoipa", "dep:utoipa-swagger-ui"]
+
 [dependencies]
 rand = "0.10.0"
 serde = { version = "1.0.219", features = ["derive"] }
@@ -27,6 +31,8 @@ base64 = "0.22.1"
 tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
 jsonwebtoken = { version = "10.3.0", features = ["rust_crypto"] }
 tracing = "0.1.44"
+utoipa = { version = "5", features = ["axum_extras"], optional = true }
+utoipa-swagger-ui = { version = "9", features = ["axum"], optional = true }
 
 [dev-dependencies]
 http-body-util = "0.1.3"

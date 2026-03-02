@@ -20,6 +20,18 @@ use uuid::Uuid;
 /// Vault: create_pass(email, password) → VaultPass
 /// SessionStore: сохраняем ek в памяти сервера
 /// Auth:  JWT access_token (без ek!) + refresh_token → auth.db
+#[cfg_attr(feature = "swagger", utoipa::path(
+    post,
+    path = "/login",
+    tag = "Auth",
+    request_body = LoginRequest,
+    responses(
+        (status = 200, description = "Login successful", body = LoginResponse),
+        (status = 400, description = "Invalid email format"),
+        (status = 401, description = "Invalid credentials"),
+        (status = 403, description = "Account temporarily locked")
+    )
+))]
 pub async fn login_handler<C: CryptoProvider + Clone + Send + Sync + 'static>(
     State(state): State<AppState<C>>,
     Json(body): Json<LoginRequest>,
@@ -97,6 +109,16 @@ pub async fn login_handler<C: CryptoProvider + Clone + Send + Sync + 'static>(
 ///
 /// Только auth: JWT decode + SessionStore + auth.db (без vault.db).
 /// Refresh-токен не требует открытия Хранилища.
+#[cfg_attr(feature = "swagger", utoipa::path(
+    post,
+    path = "/refresh",
+    tag = "Auth",
+    request_body = RefreshRequest,
+    responses(
+        (status = 200, description = "Tokens refreshed", body = LoginResponse),
+        (status = 401, description = "Invalid or expired tokens")
+    )
+))]
 pub async fn refresh_handler<C: CryptoProvider + Clone + Send + Sync + 'static>(
     State(state): State<AppState<C>>,
     Json(body): Json<RefreshRequest>,
@@ -168,6 +190,16 @@ pub async fn refresh_handler<C: CryptoProvider + Clone + Send + Sync + 'static>(
 /// После logout:
 /// - Все Bearer JWT → 401 SessionExpired (мгновенно, не через 15 мин)
 /// - Все refresh_token → 401 TokenNotFound (нечем обновить)
+#[cfg_attr(feature = "swagger", utoipa::path(
+    post,
+    path = "/logout",
+    tag = "Auth",
+    security(("bearer_jwt" = [])),
+    responses(
+        (status = 200, description = "Logged out", body = LogoutResponse),
+        (status = 401, description = "Not authenticated")
+    )
+))]
 pub async fn logout_handler<C: CryptoProvider + Clone + Send + Sync + 'static>(
     State(state): State<AppState<C>>,
     headers: axum::http::HeaderMap,
@@ -202,6 +234,16 @@ pub async fn logout_handler<C: CryptoProvider + Clone + Send + Sync + 'static>(
 ///
 /// X25519 keypair is NOT generated here — MasterPassword is consumed by create_user().
 /// Keypair is generated lazily at first login (see login_handler).
+#[cfg_attr(feature = "swagger", utoipa::path(
+    post,
+    path = "/register",
+    tag = "Auth",
+    request_body = RegisterRequest,
+    responses(
+        (status = 200, description = "User registered", body = RegisterResponse),
+        (status = 400, description = "Invalid email or user already exists")
+    )
+))]
 pub async fn register_handler<C: CryptoProvider + Clone + Send + Sync + 'static>(
     State(state): State<AppState<C>>,
     Json(body): Json<RegisterRequest>,

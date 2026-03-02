@@ -4,11 +4,29 @@ use axum::Json;
 use axum::extract::Query;
 use axum::http::StatusCode;
 
+#[cfg_attr(feature = "swagger", utoipa::path(
+    get,
+    path = "/health",
+    tag = "System",
+    responses(
+        (status = 200, description = "Service is healthy", body = String)
+    )
+))]
 pub async fn health_handler() -> &'static str {
     "ok"
 }
 
 /// GET /generate
+#[cfg_attr(feature = "swagger", utoipa::path(
+    get,
+    path = "/generate",
+    tag = "System",
+    params(GenerateParams),
+    responses(
+        (status = 200, description = "Generated password", body = GenerateResponse),
+        (status = 400, description = "Invalid parameters")
+    )
+))]
 pub async fn generate_handler(
     Query(params): Query<GenerateParams>,
 ) -> Result<Json<GenerateResponse>, StatusCode> {

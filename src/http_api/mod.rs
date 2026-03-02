@@ -34,6 +34,106 @@ use shared_vault_handlers::{
 use vault_handlers::{add_handler, delete_handler, list_handler, view_handler};
 
 // ════════════════════════════════════════════════════════════════════
+// Swagger / OpenAPI (feature = "swagger")
+// ════════════════════════════════════════════════════════════════════
+
+#[cfg(feature = "swagger")]
+mod swagger {
+    use super::dto;
+    use utoipa::openapi::security::{HttpAuthScheme, HttpBuilder, SecurityScheme};
+    use utoipa::{Modify, OpenApi};
+
+    pub struct SecurityAddon;
+
+    impl Modify for SecurityAddon {
+        fn modify(&self, openapi: &mut utoipa::openapi::OpenApi) {
+            if let Some(components) = openapi.components.as_mut() {
+                components.add_security_scheme(
+                    "bearer_jwt",
+                    SecurityScheme::Http(
+                        HttpBuilder::new()
+                            .scheme(HttpAuthScheme::Bearer)
+                            .bearer_format("JWT")
+                            .build(),
+                    ),
+                );
+            }
+        }
+    }
+
+    #[derive(OpenApi)]
+    #[openapi(
+        info(
+            title = "Vault Family API",
+            description = "Password manager API",
+            version = "0.1.7"
+        ),
+        paths(
+            // System
+            super::handlers::health_handler,
+            super::handlers::generate_handler,
+            // Auth
+            super::auth_handlers::register_handler,
+            super::auth_handlers::login_handler,
+            super::auth_handlers::refresh_handler,
+            super::auth_handlers::logout_handler,
+            // Vault
+            super::vault_handlers::add_handler,
+            super::vault_handlers::list_handler,
+            super::vault_handlers::view_handler,
+            super::vault_handlers::delete_handler,
+            // Shared Vaults
+            super::shared_vault_handlers::create_shared_vault_handler,
+            super::shared_vault_handlers::list_shared_vaults_handler,
+            super::shared_vault_handlers::delete_shared_vault_handler,
+            // Shared Vaults - Members
+            super::shared_vault_handlers::invite_member_handler,
+            super::shared_vault_handlers::list_members_handler,
+            super::shared_vault_handlers::revoke_member_handler,
+            super::shared_vault_handlers::update_permission_handler,
+            // Shared Vaults - Entries
+            super::shared_vault_handlers::add_shared_entry_handler,
+            super::shared_vault_handlers::list_shared_entries_handler,
+            super::shared_vault_handlers::view_shared_entry_handler,
+            super::shared_vault_handlers::delete_shared_entry_handler,
+        ),
+        components(schemas(
+            dto::RegisterRequest,
+            dto::RegisterResponse,
+            dto::LoginRequest,
+            dto::LoginResponse,
+            dto::RefreshRequest,
+            dto::LogoutResponse,
+            dto::AddRequest,
+            dto::AddResponse,
+            dto::ListEntry,
+            dto::ViewResponse,
+            dto::DeleteResponse,
+            dto::CreateSharedVaultRequest,
+            dto::CreateSharedVaultResponse,
+            dto::SharedVaultListItem,
+            dto::InviteMemberRequest,
+            dto::InviteMemberResponse,
+            dto::UpdatePermissionRequest,
+            dto::SharedEntryListItem,
+            dto::MemberListItem,
+            dto::GenerateParams,
+            dto::GenerateResponse,
+        )),
+        modifiers(&SecurityAddon),
+        tags(
+            (name = "System", description = "Health check and utilities"),
+            (name = "Auth", description = "Authentication and session management"),
+            (name = "Vault", description = "Personal vault entries"),
+            (name = "Shared Vaults", description = "Shared vault management"),
+            (name = "Shared Vaults - Members", description = "Shared vault member management"),
+            (name = "Shared Vaults - Entries", description = "Shared vault entry management"),
+        )
+    )]
+    pub struct ApiDoc;
+}
+
+// ════════════════════════════════════════════════════════════════════
 // Ошибки сервера
 // ════════════════════════════════════════════════════════════════════
 
@@ -172,6 +272,21 @@ pub async fn run_server(host: &str, port: u16, db_path: String) -> Result<(), Se
             failed_login_tracker: FailedLoginTracker::new(),
             crypto: RealCrypto,
         });
+
+    #[cfg(feature = "swagger")]
+    let app = {
+        if std::env::var("SWAGGER_ENABLED").unwrap_or_default() == "true" {
+            tracing::warn!("Swagger UI is ENABLED at /swagger-ui — do NOT use in production!");
+            use swagger::ApiDoc;
+            use utoipa::OpenApi;
+            use utoipa_swagger_ui::SwaggerUi;
+            app.merge(
+                SwaggerUi::new("/swagger-ui").url("/api-docs/openapi.json", ApiDoc::openapi()),
+            )
+        } else {
+            app
+        }
+    };
 
     let listener = TcpListener::bind(socket_address)
         .await
