@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 struct FileStats {
     path: String,
     total_lines: usize,
-    code_lines: usize,
+    prod_lines: usize,
     test_lines: usize,
 }
 
@@ -27,17 +27,14 @@ fn count_lines(path: &Path, src_root: &Path) -> FileStats {
     let lines: Vec<&str> = content.lines().collect();
     let total_lines = lines.len();
 
-    // Count non-blank, non-comment lines as code
-    let code_lines = lines
-        .iter()
-        .filter(|l| {
-            let trimmed = l.trim();
-            !trimmed.is_empty() && !trimmed.starts_with("//")
-        })
-        .count();
+    // Files named tests.rs are entirely test code (#[cfg(test)] mod tests; in parent)
+    let is_test_file = path.file_name().is_some_and(|name| name == "tests.rs");
 
-    // Count lines inside #[cfg(test)] modules
-    let test_lines = count_test_lines(&lines);
+    let (prod_lines, test_lines) = if is_test_file {
+        (0, total_lines)
+    } else {
+        count_prod_and_test(&lines)
+    };
 
     let rel = path
         .strip_prefix(src_root)
@@ -48,32 +45,50 @@ fn count_lines(path: &Path, src_root: &Path) -> FileStats {
     FileStats {
         path: rel,
         total_lines,
-        code_lines,
+        prod_lines,
         test_lines,
     }
 }
 
-/// Count lines that belong to `#[cfg(test)]` modules.
-/// Tracks brace depth to find where the test module ends.
-fn count_test_lines(lines: &[&str]) -> usize {
-    let mut test_lines = 0;
+/// Returns (prod_code_lines, test_total_lines).
+/// prod_code_lines = non-blank, non-comment lines OUTSIDE #[cfg(test)] blocks.
+/// test_total_lines = ALL lines inside #[cfg(test)] blocks.
+fn count_prod_and_test(lines: &[&str]) -> (usize, usize) {
+    let in_test = mark_test_lines(lines);
+
+    let prod_lines = lines
+        .iter()
+        .enumerate()
+        .filter(|(i, l)| {
+            let trimmed = l.trim();
+            !in_test[*i] && !trimmed.is_empty() && !trimmed.starts_with("//")
+        })
+        .count();
+
+    let test_lines = in_test.iter().filter(|&&b| b).count();
+
+    (prod_lines, test_lines)
+}
+
+/// Returns a Vec<bool> marking which lines are inside #[cfg(test)] modules.
+fn mark_test_lines(lines: &[&str]) -> Vec<bool> {
+    let mut result = vec![false; lines.len()];
     let mut in_test_module = false;
     let mut brace_depth: i32 = 0;
     let mut cfg_test_seen = false;
 
-    for line in lines {
+    for (i, line) in lines.iter().enumerate() {
         let trimmed = line.trim();
 
         if !in_test_module {
             if trimmed.contains("#[cfg(test)]") {
                 cfg_test_seen = true;
-                test_lines += 1;
+                result[i] = true;
                 continue;
             }
 
             if cfg_test_seen {
-                test_lines += 1;
-                // Look for opening brace of the mod
+                result[i] = true;
                 if trimmed.contains('{') {
                     in_test_module = true;
                     brace_depth = 0;
@@ -92,7 +107,7 @@ fn count_test_lines(lines: &[&str]) -> usize {
                 continue;
             }
         } else {
-            test_lines += 1;
+            result[i] = true;
             for ch in trimmed.chars() {
                 match ch {
                     '{' => brace_depth += 1,
@@ -107,7 +122,7 @@ fn count_test_lines(lines: &[&str]) -> usize {
         }
     }
 
-    test_lines
+    result
 }
 
 fn main() {
@@ -138,14 +153,14 @@ fn main() {
         .max(4);
 
     let total_all: usize = stats.iter().map(|s| s.total_lines).sum();
-    let code_all: usize = stats.iter().map(|s| s.code_lines).sum();
+    let prod_all: usize = stats.iter().map(|s| s.prod_lines).sum();
     let test_all: usize = stats.iter().map(|s| s.test_lines).sum();
 
     // Header
     println!();
     println!(
         "  {:<max_path$}  {:>7}  {:>7}  {:>7}  {:>5}",
-        "File", "Total", "Code", "Tests", "T%",
+        "File", "Total", "Prod", "Tests", "T%",
         max_path = max_path
     );
     println!("  {}", "─".repeat(max_path + 32));
@@ -157,15 +172,14 @@ fn main() {
             0
         };
 
-        // Highlight large files (>300 lines)
-        let marker = if s.total_lines > 300 { "!" } else { " " };
+        let marker = if is_candidate(s) { "!" } else { " " };
 
         println!(
             "{} {:<max_path$}  {:>7}  {:>7}  {:>7}  {:>4}%",
             marker,
             s.path,
             s.total_lines,
-            s.code_lines,
+            s.prod_lines,
             s.test_lines,
             test_pct,
             max_path = max_path
@@ -184,7 +198,7 @@ fn main() {
         "  {:<max_path$}  {:>7}  {:>7}  {:>7}  {:>4}%",
         "TOTAL",
         total_all,
-        code_all,
+        prod_all,
         test_all,
         test_pct_all,
         max_path = max_path
@@ -192,16 +206,34 @@ fn main() {
     println!();
 
     // Summary
-    let big_files: Vec<&FileStats> = stats.iter().filter(|s| s.total_lines > 300).collect();
-    if !big_files.is_empty() {
-        println!("  Candidates for splitting (>300 lines):");
-        for f in &big_files {
-            let prod_lines = f.total_lines - f.test_lines;
-            println!(
-                "    ! {}  — {} prod + {} test",
-                f.path, prod_lines, f.test_lines
-            );
+    let candidates: Vec<&FileStats> = stats.iter().filter(|s| is_candidate(s)).collect();
+    if !candidates.is_empty() {
+        println!("  Candidates for splitting:");
+        for f in &candidates {
+            let reason = if f.prod_lines > 400 && f.prod_lines > 0 && f.test_lines > f.prod_lines * 2
+            {
+                format!("{} prod + {} test (large & test-heavy)", f.prod_lines, f.test_lines)
+            } else if f.prod_lines > 400 {
+                format!("{} prod (large file)", f.prod_lines)
+            } else {
+                format!(
+                    "{} prod + {} test (test:prod > 2:1)",
+                    f.prod_lines, f.test_lines
+                )
+            };
+            println!("    ! {}  — {}", f.path, reason);
         }
         println!();
     }
+}
+
+/// Candidate if: prod > 400 lines OR (has prod code AND test:prod > 2:1)
+fn is_candidate(s: &FileStats) -> bool {
+    if s.prod_lines > 400 {
+        return true;
+    }
+    if s.prod_lines > 0 && s.test_lines > s.prod_lines * 2 {
+        return true;
+    }
+    false
 }

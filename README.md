@@ -56,7 +56,9 @@ vault-family/
 │   ├── lib.rs                  # Library crate: pub mod для всех модулей
 │   ├── main.rs                 # Binary crate: тонкая обёртка → cli::run()
 │   ├── types.rs                # Макросы branded types + VaultPass (Пропуск)
-│   ├── crypto_operations.rs    # CryptoProvider trait, RealCrypto, FakeCrypto
+│   ├── crypto_operations/      # Криптография
+│   │   ├── mod.rs              #   CryptoProvider trait, RealCrypto (PBKDF2 + AES-256-GCM)
+│   │   └── fake.rs             #   FakeCrypto — тестовая заглушка
 │   ├── password_generator.rs   # Генератор паролей с typestate (Empty → Ready)
 │   ├── cli.rs                  # CLI интерфейс (clap)
 │   ├── auth/                   # Guard — аутентификация и сессии
