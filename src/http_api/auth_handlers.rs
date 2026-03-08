@@ -294,13 +294,17 @@ pub async fn api_register_handler<C: CryptoProvider + Clone + Send + Sync + 'sta
         let email_str = body.email.clone();
 
         // 1. Create user
-        let email_for_register = Email::parse(email_str.clone()).map_err(|_| StatusCode::BAD_REQUEST)?;
+        let email_for_register =
+            Email::parse(email_str.clone()).map_err(|_| StatusCode::BAD_REQUEST)?;
         let db = DB::<Closed, C>::new(crypto.clone())
             .open(&db_path)
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
         let user = db
-            .create_user(email_for_register, MasterPassword::new(body.master_password.clone()))
+            .create_user(
+                email_for_register,
+                MasterPassword::new(body.master_password.clone()),
+            )
             .map_err(|_| StatusCode::BAD_REQUEST)?;
 
         // 2. Auto-login: create VaultPass for JWT

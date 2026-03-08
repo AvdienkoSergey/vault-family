@@ -65,6 +65,7 @@ impl<C: CryptoProvider> SharedDB<C> {
     }
 
     /// Decrypt user's X25519 private key using their EncryptionKey.
+    #[allow(dead_code)] // Will be used by shared vault re-keying flow
     pub(crate) fn decrypt_user_private_key(
         &self,
         user_id: &UserId,

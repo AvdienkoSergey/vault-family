@@ -3,8 +3,8 @@ use crate::types::{SharedVaultId, SharedVaultMember, UserId, VaultPass, VaultPer
 use chrono::{DateTime, Utc};
 use rusqlite::params;
 
-use super::error::SharedError;
 use super::SharedDB;
+use super::error::SharedError;
 
 impl<C: CryptoProvider> SharedDB<C> {
     /// Revoke a member (owner only).

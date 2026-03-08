@@ -39,8 +39,7 @@ pub async fn send_invite_handler<C: CryptoProvider + Clone + Send + Sync + 'stat
     tokio::task::spawn_blocking(move || {
         let pass = auth::guard(&headers, &jwt_secret, &session_store).map_err(StatusCode::from)?;
 
-        let role =
-            Role::from_str_role(&body.role).map_err(|_| StatusCode::BAD_REQUEST)?;
+        let role = Role::from_str_role(&body.role).map_err(|_| StatusCode::BAD_REQUEST)?;
         let permission = VaultPermission::from_str_permission(&body.permission)
             .map_err(|_| StatusCode::BAD_REQUEST)?;
 

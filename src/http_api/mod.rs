@@ -34,12 +34,21 @@ use invite_handlers::{
     list_my_invites_handler, send_invite_handler,
 };
 use shared_vault_handlers::{
-    api_create_vault_handler, api_delete_vault_handler, api_list_members_handler,
-    api_list_vaults_handler, api_pull_entries_handler, api_push_entries_handler,
-    api_revoke_member_handler, api_update_keys_handler,
+    api_create_vault_handler,
+    api_delete_vault_handler,
+    api_list_members_handler,
+    api_list_vaults_handler,
+    api_pull_entries_handler,
+    api_push_entries_handler,
+    api_revoke_member_handler,
+    api_update_keys_handler,
     // Legacy handlers
-    create_shared_vault_handler, delete_shared_vault_handler, list_members_handler,
-    list_shared_vaults_handler, revoke_member_handler, update_permission_handler,
+    create_shared_vault_handler,
+    delete_shared_vault_handler,
+    list_members_handler,
+    list_shared_vaults_handler,
+    revoke_member_handler,
+    update_permission_handler,
 };
 use vault_handlers::{add_handler, delete_handler, list_handler, view_handler};
 
@@ -229,8 +238,7 @@ pub async fn run_server(host: &str, port: u16, db_path: String) -> Result<(), Se
         // Vaults
         .route(
             "/vaults",
-            post(api_create_vault_handler::<RealCrypto>)
-                .get(api_list_vaults_handler::<RealCrypto>),
+            post(api_create_vault_handler::<RealCrypto>).get(api_list_vaults_handler::<RealCrypto>),
         )
         .route(
             "/vaults/{vault_id}",

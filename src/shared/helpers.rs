@@ -84,5 +84,4 @@ impl<C: CryptoProvider> SharedDB<C> {
             .map_err(|e| SharedError::Database(e.to_string()))?;
         Ok(count as usize)
     }
-
 }

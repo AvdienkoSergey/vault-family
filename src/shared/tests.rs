@@ -1,8 +1,7 @@
 use super::*;
 use crate::crypto_operations::FakeCrypto;
 use crate::types::{
-    EncryptionKey, EntryId, Role, SharedVaultId, SharedVaultName, UserId, VaultPass,
-    VaultPermission,
+    EncryptionKey, Role, SharedVaultId, SharedVaultName, UserId, VaultPass, VaultPermission,
 };
 
 fn open_test_shared_db() -> SharedDB<FakeCrypto> {
@@ -140,13 +139,8 @@ fn full_invite_flow_adds_member() {
 
     let uid_b = UserId::new("user-b".to_string());
 
-    let vault_id = setup_vault_with_member(
-        &db,
-        &pass_a,
-        &uid_b,
-        "b@test.com",
-        VaultPermission::Read,
-    );
+    let vault_id =
+        setup_vault_with_member(&db, &pass_a, &uid_b, "b@test.com", VaultPermission::Read);
 
     let members = db.list_members(pass_a.user_id(), &vault_id).unwrap();
     assert_eq!(members.len(), 2);
@@ -280,9 +274,7 @@ fn list_user_invites_returns_invites_by_email() {
         .unwrap();
 
     let uid_b = UserId::new("user-b".to_string());
-    let invites = db
-        .list_user_invites(&uid_b, "b@test.com")
-        .unwrap();
+    let invites = db.list_user_invites(&uid_b, "b@test.com").unwrap();
     assert_eq!(invites.len(), 1);
     assert_eq!(invites[0].vault_id.as_str(), vault.id.as_str());
 }
@@ -406,22 +398,10 @@ fn readonly_member_cannot_add_entry() {
     db.save_user_keypair(pass_a.user_id(), pass_a.encryption_key())
         .unwrap();
 
-    let vault_id = setup_vault_with_member(
-        &db,
-        &pass_a,
-        &uid_b,
-        "b@test.com",
-        VaultPermission::Read,
-    );
+    let vault_id =
+        setup_vault_with_member(&db, &pass_a, &uid_b, "b@test.com", VaultPermission::Read);
 
-    let result = db.add_shared_entry(
-        &uid_b,
-        &vault_id,
-        "entry-1",
-        "enc",
-        "nonce",
-        "cat",
-    );
+    let result = db.add_shared_entry(&uid_b, &vault_id, "entry-1", "enc", "nonce", "cat");
     assert!(matches!(result, Err(SharedError::Forbidden(_))));
 }
 
@@ -463,14 +443,7 @@ fn soft_delete_shared_entry() {
         .unwrap();
 
     let entry_id = db
-        .add_shared_entry(
-            pass.user_id(),
-            &vault.id,
-            "entry-1",
-            "enc",
-            "nonce",
-            "cat",
-        )
+        .add_shared_entry(pass.user_id(), &vault.id, "entry-1", "enc", "nonce", "cat")
         .unwrap();
 
     let deleted = db
@@ -499,14 +472,7 @@ fn delta_sync_returns_tombstones() {
     // Add entry at time T0
     let before_add = chrono::Utc::now() - chrono::Duration::seconds(1);
     let entry_id = db
-        .add_shared_entry(
-            pass.user_id(),
-            &vault.id,
-            "entry-1",
-            "enc",
-            "nonce",
-            "cat",
-        )
+        .add_shared_entry(pass.user_id(), &vault.id, "entry-1", "enc", "nonce", "cat")
         .unwrap();
 
     // Delete entry
@@ -613,13 +579,8 @@ fn revoked_member_cannot_access_vault() {
     db.save_user_keypair(pass_a.user_id(), pass_a.encryption_key())
         .unwrap();
 
-    let vault_id = setup_vault_with_member(
-        &db,
-        &pass_a,
-        &uid_b,
-        "b@test.com",
-        VaultPermission::Read,
-    );
+    let vault_id =
+        setup_vault_with_member(&db, &pass_a, &uid_b, "b@test.com", VaultPermission::Read);
 
     db.add_shared_entry(
         pass_a.user_id(),
@@ -652,15 +613,8 @@ fn delete_shared_vault_removes_all() {
         .create_shared_vault(&pass, SharedVaultName::new("V".to_string()))
         .unwrap();
 
-    db.add_shared_entry(
-        pass.user_id(),
-        &vault.id,
-        "entry-1",
-        "enc",
-        "nonce",
-        "cat",
-    )
-    .unwrap();
+    db.add_shared_entry(pass.user_id(), &vault.id, "entry-1", "enc", "nonce", "cat")
+        .unwrap();
 
     db.delete_shared_vault(&pass, &vault.id).unwrap();
 
@@ -681,19 +635,10 @@ fn list_shared_vaults_with_counts() {
         .create_shared_vault(&pass, SharedVaultName::new("V".to_string()))
         .unwrap();
 
-    db.add_shared_entry(
-        pass.user_id(),
-        &vault.id,
-        "entry-1",
-        "enc",
-        "nonce",
-        "cat",
-    )
-    .unwrap();
-
-    let vaults = db
-        .list_shared_vaults_with_counts(pass.user_id())
+    db.add_shared_entry(pass.user_id(), &vault.id, "entry-1", "enc", "nonce", "cat")
         .unwrap();
+
+    let vaults = db.list_shared_vaults_with_counts(pass.user_id()).unwrap();
     assert_eq!(vaults.len(), 1);
     assert_eq!(vaults[0].member_count, 1);
     assert_eq!(vaults[0].entry_count, 1);
