@@ -1,6 +1,7 @@
 mod auth_handlers;
 mod dto;
 mod handlers;
+mod invite_handlers;
 mod shared_vault_handlers;
 mod vault_handlers;
 
@@ -9,7 +10,7 @@ mod tests;
 
 use axum::Router;
 use axum::http::header::AUTHORIZATION;
-use axum::routing::{delete, get, patch, post};
+use axum::routing::{delete, get, patch, post, put};
 use tokio::net::TcpListener;
 use tower_http::sensitive_headers::SetSensitiveRequestHeadersLayer;
 use tower_http::trace::{DefaultMakeSpan, DefaultOnRequest, DefaultOnResponse, TraceLayer};
@@ -23,13 +24,22 @@ use crate::auth::{FailedLoginTracker, JwtSecret, SessionStore};
 use crate::crypto_operations::{CryptoProvider, RealCrypto};
 use crate::shared;
 
-use auth_handlers::{login_handler, logout_handler, refresh_handler, register_handler};
+use auth_handlers::{
+    api_login_handler, api_register_handler, login_handler, logout_handler, refresh_handler,
+    register_handler,
+};
 use handlers::{generate_handler, health_handler};
+use invite_handlers::{
+    accept_invite_handler, complete_invite_handler, get_accepted_invites_handler,
+    list_my_invites_handler, send_invite_handler,
+};
 use shared_vault_handlers::{
-    add_shared_entry_handler, create_shared_vault_handler, delete_shared_entry_handler,
-    delete_shared_vault_handler, invite_member_handler, list_members_handler,
-    list_shared_entries_handler, list_shared_vaults_handler, revoke_member_handler,
-    update_permission_handler, view_shared_entry_handler,
+    api_create_vault_handler, api_delete_vault_handler, api_list_members_handler,
+    api_list_vaults_handler, api_pull_entries_handler, api_push_entries_handler,
+    api_revoke_member_handler, api_update_keys_handler,
+    // Legacy handlers
+    create_shared_vault_handler, delete_shared_vault_handler, list_members_handler,
+    list_shared_vaults_handler, revoke_member_handler, update_permission_handler,
 };
 use vault_handlers::{add_handler, delete_handler, list_handler, view_handler};
 
@@ -77,25 +87,28 @@ mod swagger {
             super::auth_handlers::login_handler,
             super::auth_handlers::refresh_handler,
             super::auth_handlers::logout_handler,
-            // Vault
+            // Personal Vault
             super::vault_handlers::add_handler,
             super::vault_handlers::list_handler,
             super::vault_handlers::view_handler,
             super::vault_handlers::delete_handler,
-            // Shared Vaults
-            super::shared_vault_handlers::create_shared_vault_handler,
-            super::shared_vault_handlers::list_shared_vaults_handler,
-            super::shared_vault_handlers::delete_shared_vault_handler,
-            // Shared Vaults - Members
-            super::shared_vault_handlers::invite_member_handler,
-            super::shared_vault_handlers::list_members_handler,
-            super::shared_vault_handlers::revoke_member_handler,
-            super::shared_vault_handlers::update_permission_handler,
-            // Shared Vaults - Entries
-            super::shared_vault_handlers::add_shared_entry_handler,
-            super::shared_vault_handlers::list_shared_entries_handler,
-            super::shared_vault_handlers::view_shared_entry_handler,
-            super::shared_vault_handlers::delete_shared_entry_handler,
+            // API — Shared Vaults (zero-knowledge)
+            super::shared_vault_handlers::api_create_vault_handler,
+            super::shared_vault_handlers::api_list_vaults_handler,
+            super::shared_vault_handlers::api_delete_vault_handler,
+            // API — Members
+            super::shared_vault_handlers::api_list_members_handler,
+            super::shared_vault_handlers::api_revoke_member_handler,
+            super::shared_vault_handlers::api_update_keys_handler,
+            // API — Entries
+            super::shared_vault_handlers::api_push_entries_handler,
+            super::shared_vault_handlers::api_pull_entries_handler,
+            // API — Invites
+            super::invite_handlers::send_invite_handler,
+            super::invite_handlers::list_my_invites_handler,
+            super::invite_handlers::accept_invite_handler,
+            super::invite_handlers::get_accepted_invites_handler,
+            super::invite_handlers::complete_invite_handler,
         ),
         components(schemas(
             dto::RegisterRequest,
@@ -112,22 +125,34 @@ mod swagger {
             dto::CreateSharedVaultRequest,
             dto::CreateSharedVaultResponse,
             dto::SharedVaultListItem,
-            dto::InviteMemberRequest,
-            dto::InviteMemberResponse,
             dto::UpdatePermissionRequest,
-            dto::SharedEntryListItem,
             dto::MemberListItem,
             dto::GenerateParams,
             dto::GenerateResponse,
+            // New API DTOs
+            dto::ApiSharedVaultItem,
+            dto::SendInviteRequest,
+            dto::SendInviteResponse,
+            dto::AcceptInviteRequest,
+            dto::CompleteInviteRequest,
+            dto::ApiInviteItem,
+            dto::ApiAcceptedInviteItem,
+            dto::ApiMemberItem,
+            dto::MemberKeyUpdateItem,
+            dto::UpdateMemberKeysRequest,
+            dto::ApiEncryptedEntryItem,
+            dto::PushEntriesRequest,
+            dto::PullEntriesQuery,
         )),
         modifiers(&SecurityAddon),
         tags(
             (name = "System", description = "Health check and utilities"),
             (name = "Auth", description = "Authentication and session management"),
             (name = "Vault", description = "Personal vault entries"),
-            (name = "Shared Vaults", description = "Shared vault management"),
-            (name = "Shared Vaults - Members", description = "Shared vault member management"),
-            (name = "Shared Vaults - Entries", description = "Shared vault entry management"),
+            (name = "Shared Vaults", description = "Shared vault management (zero-knowledge)"),
+            (name = "Invites", description = "4-step invitation flow"),
+            (name = "Members", description = "Shared vault member management"),
+            (name = "Entries", description = "Encrypted entry storage (zero-knowledge)"),
         )
     )]
     pub struct ApiDoc;
@@ -196,18 +221,75 @@ pub async fn run_server(host: &str, port: u16, db_path: String) -> Result<(), Se
         .compact()
         .init();
 
+    // New /api/* routes (zero-knowledge relay for mobile frontend)
+    let api_routes: Router<AppState<RealCrypto>> = Router::new()
+        // Auth
+        .route("/auth/register", post(api_register_handler::<RealCrypto>))
+        .route("/auth/login", post(api_login_handler::<RealCrypto>))
+        // Vaults
+        .route(
+            "/vaults",
+            post(api_create_vault_handler::<RealCrypto>)
+                .get(api_list_vaults_handler::<RealCrypto>),
+        )
+        .route(
+            "/vaults/{vault_id}",
+            delete(api_delete_vault_handler::<RealCrypto>),
+        )
+        // Invites (vault-scoped)
+        .route(
+            "/vaults/{vault_id}/invites",
+            post(send_invite_handler::<RealCrypto>),
+        )
+        .route(
+            "/vaults/{vault_id}/invites/accepted",
+            get(get_accepted_invites_handler::<RealCrypto>),
+        )
+        // Invites (user-scoped)
+        .route("/invites", get(list_my_invites_handler::<RealCrypto>))
+        .route(
+            "/invites/{invite_id}/accept",
+            post(accept_invite_handler::<RealCrypto>),
+        )
+        .route(
+            "/invites/{invite_id}/complete",
+            post(complete_invite_handler::<RealCrypto>),
+        )
+        // Members
+        .route(
+            "/vaults/{vault_id}/members",
+            get(api_list_members_handler::<RealCrypto>),
+        )
+        .route(
+            "/vaults/{vault_id}/members/{user_id}",
+            delete(api_revoke_member_handler::<RealCrypto>),
+        )
+        // Re-keying
+        .route(
+            "/vaults/{vault_id}/keys",
+            put(api_update_keys_handler::<RealCrypto>),
+        )
+        // Entries (zero-knowledge)
+        .route(
+            "/vaults/{vault_id}/entries",
+            post(api_push_entries_handler::<RealCrypto>)
+                .get(api_pull_entries_handler::<RealCrypto>),
+        );
+
     let app: Router = Router::new()
         .route("/health", get(health_handler))
+        // Legacy auth routes
         .route("/login", post(login_handler::<RealCrypto>))
         .route("/logout", post(logout_handler::<RealCrypto>))
         .route("/refresh", post(refresh_handler::<RealCrypto>))
         .route("/register", post(register_handler::<RealCrypto>))
+        // Personal vault
         .route("/add", post(add_handler::<RealCrypto>))
         .route("/list", get(list_handler::<RealCrypto>))
         .route("/view/{id}", get(view_handler::<RealCrypto>))
         .route("/delete/{id}", delete(delete_handler::<RealCrypto>))
         .route("/generate", get(generate_handler))
-        // Shared vaults
+        // Legacy shared vault routes (backward compatibility)
         .route(
             "/shared-vaults",
             post(create_shared_vault_handler::<RealCrypto>),
@@ -221,10 +303,6 @@ pub async fn run_server(host: &str, port: u16, db_path: String) -> Result<(), Se
             delete(delete_shared_vault_handler::<RealCrypto>),
         )
         .route(
-            "/shared-vaults/{vault_id}/invite",
-            post(invite_member_handler::<RealCrypto>),
-        )
-        .route(
             "/shared-vaults/{vault_id}/members",
             get(list_members_handler::<RealCrypto>),
         )
@@ -236,22 +314,8 @@ pub async fn run_server(host: &str, port: u16, db_path: String) -> Result<(), Se
             "/shared-vaults/{vault_id}/members/{user_id}",
             patch(update_permission_handler::<RealCrypto>),
         )
-        .route(
-            "/shared-vaults/{vault_id}/entries",
-            post(add_shared_entry_handler::<RealCrypto>),
-        )
-        .route(
-            "/shared-vaults/{vault_id}/entries",
-            get(list_shared_entries_handler::<RealCrypto>),
-        )
-        .route(
-            "/shared-vaults/{vault_id}/entries/{entry_id}",
-            get(view_shared_entry_handler::<RealCrypto>),
-        )
-        .route(
-            "/shared-vaults/{vault_id}/entries/{entry_id}",
-            delete(delete_shared_entry_handler::<RealCrypto>),
-        )
+        // Mount new API routes
+        .nest("/api", api_routes)
         .layer(
             TraceLayer::new_for_http()
                 .make_span_with(

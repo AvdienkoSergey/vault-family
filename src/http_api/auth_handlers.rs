@@ -1,6 +1,7 @@
 use super::AppState;
 use super::dto::{
-    LoginRequest, LoginResponse, LogoutResponse, RefreshRequest, RegisterRequest, RegisterResponse,
+    ApiLoginResponse, ApiRegisterRequest, ApiRegisterResponse, LoginRequest, LoginResponse,
+    LogoutResponse, RefreshRequest, RegisterRequest, RegisterResponse,
 };
 use crate::auth;
 use crate::auth::{AuthStore, RefreshTokenHash, jwt_provider};
@@ -265,6 +266,137 @@ pub async fn register_handler<C: CryptoProvider + Clone + Send + Sync + 'static>
         Ok(Json(RegisterResponse {
             user_id: user.id.as_str().to_string(),
             message: "User registered successfully".to_string(),
+        }))
+    })
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+}
+
+// ════════════════════════════════════════════════════════════════════
+// API auth handlers (mobile frontend — simplified responses)
+// ════════════════════════════════════════════════════════════════════
+
+/// POST /api/auth/register
+///
+/// Registers user + creates keypair + auto-login. Returns {user_id, token}.
+pub async fn api_register_handler<C: CryptoProvider + Clone + Send + Sync + 'static>(
+    State(state): State<AppState<C>>,
+    Json(body): Json<ApiRegisterRequest>,
+) -> Result<Json<ApiRegisterResponse>, StatusCode> {
+    let db_path = state.db_path.clone();
+    let auth_db_path = state.auth_db_path.clone();
+    let shared_db_path = state.shared_db_path.clone();
+    let jwt_secret = state.jwt_secret.clone();
+    let session_store = state.session_store.clone();
+    let crypto = state.crypto.clone();
+
+    tokio::task::spawn_blocking(move || {
+        let email_str = body.email.clone();
+
+        // 1. Create user
+        let email_for_register = Email::parse(email_str.clone()).map_err(|_| StatusCode::BAD_REQUEST)?;
+        let db = DB::<Closed, C>::new(crypto.clone())
+            .open(&db_path)
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+        let user = db
+            .create_user(email_for_register, MasterPassword::new(body.master_password.clone()))
+            .map_err(|_| StatusCode::BAD_REQUEST)?;
+
+        // 2. Auto-login: create VaultPass for JWT
+        let email_for_login = Email::parse(email_str).map_err(|_| StatusCode::BAD_REQUEST)?;
+        let pass = db
+            .create_pass(email_for_login, MasterPassword::new(body.master_password))
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+        // 3. SessionStore: save encryption key
+        session_store.insert(
+            pass.user_id().as_str(),
+            &EncryptionKey::new(pass.encryption_key().as_str().to_string()),
+        );
+
+        // 4. Generate keypair (lazy — same as login)
+        if let Ok(shared_db) = SharedDB::open(&shared_db_path, crypto) {
+            let _ = shared_db.save_user_keypair(pass.user_id(), pass.encryption_key());
+        }
+
+        // 5. JWT access token
+        let access_token = jwt_provider::create_access_token_from_pass(&pass, &jwt_secret)
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+        // 6. Refresh token → auth.db
+        let refresh_token = Uuid::new_v4().to_string();
+        let hash = hex::encode(Sha256::digest(refresh_token.as_bytes()));
+        let token_hash = RefreshTokenHash::new(hash);
+        let expires_at = Utc::now() + chrono::Duration::days(auth::REFRESH_TOKEN_TTL_DAYS);
+
+        let store =
+            AuthStore::open(&auth_db_path).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        store
+            .save_refresh_token(&token_hash, pass.user_id(), expires_at)
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+        Ok(Json(ApiRegisterResponse {
+            user_id: user.id.as_str().to_string(),
+            token: access_token,
+        }))
+    })
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+}
+
+/// POST /api/auth/login
+///
+/// Same as login_handler but returns simplified {user_id, token}.
+pub async fn api_login_handler<C: CryptoProvider + Clone + Send + Sync + 'static>(
+    State(state): State<AppState<C>>,
+    Json(body): Json<LoginRequest>,
+) -> Result<Json<ApiLoginResponse>, StatusCode> {
+    let db_path = state.db_path.clone();
+    let shared_db_path = state.shared_db_path.clone();
+    let jwt_secret = state.jwt_secret.clone();
+    let session_store = state.session_store.clone();
+    let failed_login_tracker = state.failed_login_tracker.clone();
+    let crypto = state.crypto.clone();
+
+    tokio::task::spawn_blocking(move || {
+        let email_str = body.email.clone();
+        let email = Email::parse(body.email).map_err(|_| StatusCode::BAD_REQUEST)?;
+
+        if failed_login_tracker.is_locked(&email_str) {
+            return Err(StatusCode::FORBIDDEN);
+        }
+
+        let db = DB::<Closed, C>::new(crypto.clone())
+            .open(&db_path)
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+        let pass = db
+            .create_pass(email, MasterPassword::new(body.master_password))
+            .map_err(|_| {
+                failed_login_tracker.record_failed_attempt(&email_str);
+                StatusCode::UNAUTHORIZED
+            })?;
+
+        session_store.insert(
+            pass.user_id().as_str(),
+            &EncryptionKey::new(pass.encryption_key().as_str().to_string()),
+        );
+
+        // Lazy keypair generation
+        if let Ok(shared_db) = SharedDB::open(&shared_db_path, crypto) {
+            let has_kp = shared_db.has_user_keypair(pass.user_id()).unwrap_or(false);
+            if !has_kp {
+                let _ = shared_db.save_user_keypair(pass.user_id(), pass.encryption_key());
+            }
+        }
+
+        let access_token = jwt_provider::create_access_token_from_pass(&pass, &jwt_secret)
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+        Ok(Json(ApiLoginResponse {
+            user_id: pass.user_id().as_str().to_string(),
+            token: access_token,
         }))
     })
     .await
