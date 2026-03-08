@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/vault-crypto-wasm"]
+members = ["crates/vault-crypto-wasm", "tools/file-stats"]
 
 [package]
 name = "vault-family"

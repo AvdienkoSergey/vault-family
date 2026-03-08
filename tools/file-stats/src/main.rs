@@ -145,12 +145,7 @@ fn main() {
     stats.sort_by(|a, b| b.total_lines.cmp(&a.total_lines));
 
     // Calculate column widths
-    let max_path = stats
-        .iter()
-        .map(|s| s.path.len())
-        .max()
-        .unwrap_or(4)
-        .max(4);
+    let max_path = stats.iter().map(|s| s.path.len()).max().unwrap_or(4).max(4);
 
     let total_all: usize = stats.iter().map(|s| s.total_lines).sum();
     let prod_all: usize = stats.iter().map(|s| s.prod_lines).sum();
@@ -160,7 +155,11 @@ fn main() {
     println!();
     println!(
         "  {:<max_path$}  {:>7}  {:>7}  {:>7}  {:>5}",
-        "File", "Total", "Prod", "Tests", "T%",
+        "File",
+        "Total",
+        "Prod",
+        "Tests",
+        "T%",
         max_path = max_path
     );
     println!("  {}", "─".repeat(max_path + 32));
@@ -210,17 +209,20 @@ fn main() {
     if !candidates.is_empty() {
         println!("  Candidates for splitting:");
         for f in &candidates {
-            let reason = if f.prod_lines > 400 && f.prod_lines > 0 && f.test_lines > f.prod_lines * 2
-            {
-                format!("{} prod + {} test (large & test-heavy)", f.prod_lines, f.test_lines)
-            } else if f.prod_lines > 400 {
-                format!("{} prod (large file)", f.prod_lines)
-            } else {
-                format!(
-                    "{} prod + {} test (test:prod > 2:1)",
-                    f.prod_lines, f.test_lines
-                )
-            };
+            let reason =
+                if f.prod_lines > 400 && f.prod_lines > 0 && f.test_lines > f.prod_lines * 2 {
+                    format!(
+                        "{} prod + {} test (large & test-heavy)",
+                        f.prod_lines, f.test_lines
+                    )
+                } else if f.prod_lines > 400 {
+                    format!("{} prod (large file)", f.prod_lines)
+                } else {
+                    format!(
+                        "{} prod + {} test (test:prod > 2:1)",
+                        f.prod_lines, f.test_lines
+                    )
+                };
             println!("    ! {}  — {}", f.path, reason);
         }
         println!();
