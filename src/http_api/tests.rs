@@ -60,10 +60,7 @@ impl TestApp {
         };
 
         let api_routes: Router<AppState<FakeCrypto>> = Router::new()
-            .route(
-                "/auth/register",
-                post(api_register_handler::<FakeCrypto>),
-            )
+            .route("/auth/register", post(api_register_handler::<FakeCrypto>))
             .route("/auth/login", post(api_login_handler::<FakeCrypto>))
             .route(
                 "/vaults",
@@ -712,9 +709,7 @@ async fn api_create_vault(app: &TestApp, token: &str, name: &str) -> String {
         .uri("/api/vaults")
         .header("content-type", "application/json")
         .header("authorization", format!("Bearer {token}"))
-        .body(Body::from(
-            serde_json::json!({ "name": name }).to_string(),
-        ))
+        .body(Body::from(serde_json::json!({ "name": name }).to_string()))
         .unwrap();
     let resp = app.request(req).await;
     assert_eq!(resp.status(), StatusCode::CREATED);
@@ -1095,8 +1090,7 @@ async fn api_full_invite_flow() {
     let app = TestApp::new();
     let (owner_id, owner_token) =
         api_register_and_login(&app, "alice@example.com", "Secret123!").await;
-    let (bob_id, bob_token) =
-        api_register_and_login(&app, "bob@example.com", "Secret123!").await;
+    let (bob_id, bob_token) = api_register_and_login(&app, "bob@example.com", "Secret123!").await;
     let vault_id = api_create_vault(&app, &owner_token, "Family").await;
 
     // Full flow
@@ -1121,7 +1115,10 @@ async fn api_full_invite_flow() {
     let resp = app.request(req).await;
     let json = body_json(resp).await;
     let members = json.as_array().unwrap();
-    let member_ids: Vec<&str> = members.iter().map(|m| m["user_id"].as_str().unwrap()).collect();
+    let member_ids: Vec<&str> = members
+        .iter()
+        .map(|m| m["user_id"].as_str().unwrap())
+        .collect();
     assert!(member_ids.contains(&owner_id.as_str()));
     assert!(member_ids.contains(&bob_id.as_str()));
 }
@@ -1177,8 +1174,7 @@ async fn api_list_members_returns_details() {
 async fn api_revoke_member_removes() {
     let app = TestApp::new();
     let (_, owner_token) = api_register_and_login(&app, "alice@example.com", "Secret123!").await;
-    let (bob_id, bob_token) =
-        api_register_and_login(&app, "bob@example.com", "Secret123!").await;
+    let (bob_id, bob_token) = api_register_and_login(&app, "bob@example.com", "Secret123!").await;
     let vault_id = api_create_vault(&app, &owner_token, "Family").await;
 
     api_full_invite(&app, &owner_token, &vault_id, "bob@example.com", &bob_token).await;
@@ -1499,8 +1495,7 @@ async fn api_rekey_after_revoke_flow() {
     let app = TestApp::new();
     let (owner_id, owner_token) =
         api_register_and_login(&app, "alice@example.com", "Secret123!").await;
-    let (bob_id, bob_token) =
-        api_register_and_login(&app, "bob@example.com", "Secret123!").await;
+    let (bob_id, bob_token) = api_register_and_login(&app, "bob@example.com", "Secret123!").await;
     let vault_id = api_create_vault(&app, &owner_token, "Family").await;
 
     // Invite bob
