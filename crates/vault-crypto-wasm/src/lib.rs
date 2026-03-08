@@ -11,8 +11,7 @@
 use aes_gcm::aead::Aead;
 use aes_gcm::{AeadCore, Aes256Gcm, KeyInit};
 use pbkdf2::password_hash::{
-    PasswordHash, PasswordHasher, PasswordVerifier, SaltString,
-    rand_core::OsRng,
+    rand_core::OsRng, PasswordHash, PasswordHasher, PasswordVerifier, SaltString,
 };
 use pbkdf2::Pbkdf2;
 use serde::{Deserialize, Serialize};
@@ -81,8 +80,8 @@ pub fn hash_master_password(password: &str) -> Result<JsValue, JsError> {
 /// Совместимо с серверным `RealCrypto::verify_master_password`.
 #[wasm_bindgen(js_name = "verifyMasterPassword")]
 pub fn verify_master_password(password: &str, hash: &str) -> Result<bool, JsError> {
-    let parsed_hash = PasswordHash::new(hash)
-        .map_err(|e| JsError::new(&format!("invalid hash format: {e}")))?;
+    let parsed_hash =
+        PasswordHash::new(hash).map_err(|e| JsError::new(&format!("invalid hash format: {e}")))?;
     Ok(Pbkdf2
         .verify_password(password.as_bytes(), &parsed_hash)
         .is_ok())
@@ -116,8 +115,7 @@ pub fn derive_encryption_key(password: &str, salt: &str) -> String {
 #[wasm_bindgen(js_name = "generateEncryptionSalt")]
 pub fn generate_encryption_salt() -> Result<String, JsError> {
     let mut bytes = [0u8; 16];
-    getrandom::getrandom(&mut bytes)
-        .map_err(|e| JsError::new(&format!("RNG failed: {e}")))?;
+    getrandom::getrandom(&mut bytes).map_err(|e| JsError::new(&format!("RNG failed: {e}")))?;
     Ok(hex::encode(bytes))
 }
 
@@ -322,8 +320,7 @@ pub fn x25519_derive_shared_key(
 #[wasm_bindgen(js_name = "generateSharedVaultKey")]
 pub fn generate_shared_vault_key() -> Result<String, JsError> {
     let mut bytes = [0u8; 32];
-    getrandom::getrandom(&mut bytes)
-        .map_err(|e| JsError::new(&format!("RNG failed: {e}")))?;
+    getrandom::getrandom(&mut bytes).map_err(|e| JsError::new(&format!("RNG failed: {e}")))?;
     let result = hex::encode(bytes);
     bytes.zeroize();
     Ok(result)
@@ -369,12 +366,16 @@ pub fn generate_password(
 
     // 4 random bytes per character (rejection-free modular selection)
     let mut buf = vec![0u8; length * 4];
-    getrandom::getrandom(&mut buf)
-        .map_err(|e| JsError::new(&format!("RNG failed: {e}")))?;
+    getrandom::getrandom(&mut buf).map_err(|e| JsError::new(&format!("RNG failed: {e}")))?;
 
     for i in 0..length {
         let offset = i * 4;
-        let val = u32::from_le_bytes([buf[offset], buf[offset + 1], buf[offset + 2], buf[offset + 3]]);
+        let val = u32::from_le_bytes([
+            buf[offset],
+            buf[offset + 1],
+            buf[offset + 2],
+            buf[offset + 3],
+        ]);
         result.push(pool[val as usize % pool_len]);
     }
 
