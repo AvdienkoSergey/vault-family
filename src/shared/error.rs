@@ -11,6 +11,9 @@ pub enum SharedError {
     Forbidden(String),
     MemberLimit(String),
     NoKeypair(String),
+    InviteNotFound(String),
+    InvalidInviteState(String),
+    Conflict(String),
 }
 
 impl fmt::Display for SharedError {
@@ -24,6 +27,9 @@ impl fmt::Display for SharedError {
             SharedError::Forbidden(msg) => write!(f, "forbidden: {msg}"),
             SharedError::MemberLimit(msg) => write!(f, "member limit: {msg}"),
             SharedError::NoKeypair(msg) => write!(f, "no keypair: {msg}"),
+            SharedError::InviteNotFound(msg) => write!(f, "invite not found: {msg}"),
+            SharedError::InvalidInviteState(msg) => write!(f, "invalid invite state: {msg}"),
+            SharedError::Conflict(msg) => write!(f, "conflict: {msg}"),
         }
     }
 }

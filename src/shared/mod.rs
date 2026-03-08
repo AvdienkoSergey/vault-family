@@ -1,11 +1,13 @@
 mod entries;
 mod error;
 mod helpers;
+mod invites;
 mod keypair;
 mod membership;
 mod vault;
 
 pub use error::SharedError;
+pub use vault::SharedVaultWithCounts;
 
 use crate::crypto_operations::CryptoProvider;
 use rusqlite::Connection;
@@ -69,9 +71,10 @@ impl<C: CryptoProvider> SharedDB<C> {
             CREATE TABLE IF NOT EXISTS shared_vault_members (
                 vault_id             TEXT NOT NULL,
                 user_id              TEXT NOT NULL,
-                encrypted_vault_key  TEXT NOT NULL,
-                vault_key_nonce      TEXT NOT NULL,
-                ephemeral_public_key TEXT NOT NULL,
+                encrypted_vault_key  TEXT NOT NULL DEFAULT '',
+                vault_key_nonce      TEXT NOT NULL DEFAULT '',
+                ephemeral_public_key TEXT NOT NULL DEFAULT '',
+                role                 TEXT NOT NULL DEFAULT 'viewer',
                 permission           TEXT NOT NULL DEFAULT 'read',
                 invited_at           TEXT NOT NULL,
                 PRIMARY KEY (vault_id, user_id)
@@ -81,9 +84,28 @@ impl<C: CryptoProvider> SharedDB<C> {
                 vault_id       TEXT NOT NULL,
                 encrypted_data TEXT NOT NULL,
                 nonce          TEXT NOT NULL,
+                category       TEXT NOT NULL DEFAULT '',
                 created_by     TEXT NOT NULL,
                 created_at     TEXT NOT NULL,
-                updated_at     TEXT NOT NULL
+                updated_at     TEXT NOT NULL,
+                deleted        INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE IF NOT EXISTS invites (
+                id                  TEXT PRIMARY KEY,
+                vault_id            TEXT NOT NULL,
+                inviter_id          TEXT NOT NULL,
+                invitee_email       TEXT NOT NULL,
+                role                TEXT NOT NULL DEFAULT 'viewer',
+                permission          TEXT NOT NULL DEFAULT 'read',
+                code_hash           TEXT NOT NULL,
+                status              TEXT NOT NULL DEFAULT 'pending',
+                invitee_user_id     TEXT,
+                invitee_public_key  TEXT,
+                confirmation_key    TEXT,
+                encrypted_vault_key TEXT,
+                vault_key_nonce     TEXT,
+                created_at          TEXT NOT NULL,
+                updated_at          TEXT NOT NULL
             );",
         )
         .map_err(|e| SharedError::Schema(format!("Failed to create shared tables: {e}")))?;
