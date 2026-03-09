@@ -100,9 +100,7 @@ mod tests {
     #[test]
     fn issue_and_consume() {
         let store = TicketStore::new();
-        let ticket = store
-            .issue("user-1".into(), "a@b.com".into())
-            .unwrap();
+        let ticket = store.issue("user-1".into(), "a@b.com".into()).unwrap();
         let (uid, email) = store.consume(&ticket).unwrap();
         assert_eq!(uid, "user-1");
         assert_eq!(email, "a@b.com");
@@ -111,9 +109,7 @@ mod tests {
     #[test]
     fn consume_is_one_time() {
         let store = TicketStore::new();
-        let ticket = store
-            .issue("user-1".into(), "a@b.com".into())
-            .unwrap();
+        let ticket = store.issue("user-1".into(), "a@b.com".into()).unwrap();
         assert!(store.consume(&ticket).is_some());
         assert!(store.consume(&ticket).is_none());
     }

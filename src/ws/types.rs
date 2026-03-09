@@ -40,8 +40,9 @@ pub enum VaultEvent {
 
     /// A new member joined (invite completed).
     /// Sent to: all existing members.
-    MemberJoined {
-        vault_id: String,
-        user_id: String,
-    },
+    MemberJoined { vault_id: String, user_id: String },
+
+    /// Someone tried to login with this user's email but wrong password.
+    /// Sent to: the legitimate user (all connected devices).
+    UnauthorizedLoginAttempt { email: String, timestamp: String },
 }

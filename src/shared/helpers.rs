@@ -73,6 +73,22 @@ impl<C: CryptoProvider> SharedDB<C> {
         Ok(count > 0)
     }
 
+    /// Get all member user_ids for a vault (for WS fan-out, no auth check).
+    pub fn get_member_user_ids(
+        &self,
+        vault_id: &SharedVaultId,
+    ) -> Result<Vec<String>, SharedError> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT user_id FROM shared_vault_members WHERE vault_id = ?1")
+            .map_err(|e| SharedError::Database(e.to_string()))?;
+        let rows = stmt
+            .query_map(params![vault_id.as_str()], |row| row.get::<_, String>(0))
+            .map_err(|e| SharedError::Database(e.to_string()))?;
+        rows.map(|r| r.map_err(|e| SharedError::Database(e.to_string())))
+            .collect()
+    }
+
     pub(crate) fn member_count(&self, vault_id: &SharedVaultId) -> Result<usize, SharedError> {
         let count: i64 = self
             .conn

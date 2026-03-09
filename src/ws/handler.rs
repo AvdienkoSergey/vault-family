@@ -6,11 +6,11 @@
 //! 3. Server pushes VaultEvent JSON frames to client
 //! 4. Client sends only ping; server responds with pong
 
+use axum::Json;
 use axum::extract::ws::{Message, WebSocket};
 use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
-use axum::Json;
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
 
@@ -34,8 +34,7 @@ pub(crate) async fn ws_ticket_handler<C: CryptoProvider + Clone + Send + Sync + 
     let jwt_secret = state.jwt_secret.clone();
     let session_store = state.session_store.clone();
 
-    let pass =
-        auth::guard(&headers, &jwt_secret, &session_store).map_err(StatusCode::from)?;
+    let pass = auth::guard(&headers, &jwt_secret, &session_store).map_err(StatusCode::from)?;
 
     let ticket = state
         .ticket_store
@@ -93,7 +92,11 @@ async fn handle_socket(
     // Writer task: registry events → WebSocket frames
     let writer = tokio::spawn(async move {
         while let Some(event_json) = event_rx.recv().await {
-            if ws_sink.send(Message::Text(event_json.into())).await.is_err() {
+            if ws_sink
+                .send(Message::Text(event_json.into()))
+                .await
+                .is_err()
+            {
                 break; // WebSocket closed
             }
         }
@@ -102,12 +105,11 @@ async fn handle_socket(
     // Reader task: client messages → handle pings, detect close
     let reader = tokio::spawn(async move {
         while let Some(Ok(msg)) = ws_stream.next().await {
-            match msg {
-                Message::Close(_) => break,
-                // Axum handles Ping/Pong at the protocol level automatically,
-                // but we can also handle application-level pings if needed.
-                _ => {} // ignore other client messages
+            if let Message::Close(_) = msg {
+                break;
             }
+            // Axum handles Ping/Pong at the protocol level automatically;
+            // all other client messages are ignored.
         }
     });
 

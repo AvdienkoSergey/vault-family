@@ -7,3 +7,4 @@ pub mod shared;
 pub mod transfer;
 pub mod types;
 pub mod vault;
+pub mod ws;
