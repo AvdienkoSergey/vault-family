@@ -62,6 +62,7 @@ impl TestApp {
             ws_registry: crate::ws::ConnectionRegistry::new(),
             ticket_store: crate::ws::TicketStore::new(),
             security_lock: crate::auth::SecurityLockStore::new(),
+            device_trust: crate::auth::DeviceTrustStore::new(),
         };
 
         let api_routes: Router<AppState<FakeCrypto>> = Router::new()
@@ -670,7 +671,8 @@ async fn login_locked_after_max_attempts() {
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }
 
-    // Следующая попытка (даже с ПРАВИЛЬНЫМ паролем) → 403
+    // Next attempt (even correct password) → 403 (no PBKDF2 executed)
+    // Lock expires after FAILED_ATTEMPTS_WINDOW_SECS (5 min)
     let req = Request::builder()
         .method("POST")
         .uri("/login")

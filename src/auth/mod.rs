@@ -6,6 +6,7 @@
 //! **Не зависит от vault/** — не знает про записи, шифрование, entries.
 //! Единственный мост между auth и vault — `VaultPass` из `types.rs`.
 
+pub mod device_trust;
 pub mod failed_login_tracker;
 pub mod jwt_provider;
 pub mod jwt_secret;
@@ -18,6 +19,7 @@ use crate::types::{UserId, VaultPass};
 use axum::http::StatusCode;
 
 // Re-exports для удобства
+pub use device_trust::DeviceTrustStore;
 pub use failed_login_tracker::FailedLoginTracker;
 pub use jwt_provider::{Claims, JwtError, REFRESH_TOKEN_TTL_DAYS};
 pub use jwt_store::{AuthStore, StoreError};

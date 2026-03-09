@@ -22,15 +22,17 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use crate::auth;
-use crate::auth::{FailedLoginTracker, JwtSecret, SecurityLockStore, SessionStore};
+use crate::auth::{
+    DeviceTrustStore, FailedLoginTracker, JwtSecret, SecurityLockStore, SessionStore,
+};
 use crate::crypto_operations::{CryptoProvider, RealCrypto};
 use crate::shared;
 use crate::transfer::{TransferRateLimiter, TransferStore};
 use crate::ws::{ConnectionRegistry, TicketStore};
 
 use auth_handlers::{
-    api_login_handler, api_register_handler, api_security_lock_handler, login_handler,
-    logout_handler, refresh_handler, register_handler,
+    api_change_password_handler, api_login_handler, api_register_handler,
+    api_security_lock_handler, login_handler, logout_handler, refresh_handler, register_handler,
 };
 use handlers::{generate_handler, health_handler};
 use invite_handlers::{
@@ -230,6 +232,8 @@ pub(crate) struct AppState<C: CryptoProvider + Clone> {
     pub(crate) ticket_store: TicketStore,
     /// Permanent security lock triggered by legitimate user
     pub(crate) security_lock: SecurityLockStore,
+    /// Trusted devices per email (exempt from brute-force/security lock)
+    pub(crate) device_trust: DeviceTrustStore,
 }
 
 // ════════════════════════════════════════════════════════════════════
@@ -344,6 +348,10 @@ pub async fn run_server(host: &str, port: u16, db_path: String) -> Result<(), Se
             "/auth/security-lock",
             post(api_security_lock_handler::<RealCrypto>),
         )
+        .route(
+            "/auth/change-password",
+            post(api_change_password_handler::<RealCrypto>),
+        )
         // WebSocket ticket
         .route(
             "/ws/ticket",
@@ -421,6 +429,7 @@ pub async fn run_server(host: &str, port: u16, db_path: String) -> Result<(), Se
             ws_registry,
             ticket_store,
             security_lock: SecurityLockStore::new(),
+            device_trust: DeviceTrustStore::new(),
         });
 
     #[cfg(feature = "swagger")]
