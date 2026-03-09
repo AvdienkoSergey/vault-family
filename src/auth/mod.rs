@@ -11,6 +11,7 @@ pub mod jwt_provider;
 pub mod jwt_secret;
 pub mod jwt_store;
 mod jwt_types;
+pub mod security_lock;
 pub mod session_store;
 
 use crate::types::{UserId, VaultPass};
@@ -21,6 +22,7 @@ pub use failed_login_tracker::FailedLoginTracker;
 pub use jwt_provider::{Claims, JwtError, REFRESH_TOKEN_TTL_DAYS};
 pub use jwt_store::{AuthStore, StoreError};
 pub use jwt_types::{JwtSecret, RefreshTokenHash};
+pub use security_lock::SecurityLockStore;
 pub use session_store::SessionStore;
 
 // ════════════════════════════════════════════════════════════════════
