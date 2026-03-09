@@ -59,6 +59,9 @@ impl TestApp {
             crypto: FakeCrypto,
             transfer_store: crate::transfer::TransferStore::new(),
             transfer_rate_limiter: crate::transfer::TransferRateLimiter::new(),
+            ws_registry: crate::ws::ConnectionRegistry::new(),
+            ticket_store: crate::ws::TicketStore::new(),
+            security_lock: crate::auth::SecurityLockStore::new(),
         };
 
         let api_routes: Router<AppState<FakeCrypto>> = Router::new()

@@ -22,14 +22,15 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use crate::auth;
-use crate::auth::{FailedLoginTracker, JwtSecret, SessionStore};
+use crate::auth::{FailedLoginTracker, JwtSecret, SecurityLockStore, SessionStore};
 use crate::crypto_operations::{CryptoProvider, RealCrypto};
 use crate::shared;
 use crate::transfer::{TransferRateLimiter, TransferStore};
+use crate::ws::{ConnectionRegistry, TicketStore};
 
 use auth_handlers::{
-    api_login_handler, api_register_handler, login_handler, logout_handler, refresh_handler,
-    register_handler,
+    api_login_handler, api_register_handler, api_security_lock_handler, login_handler,
+    logout_handler, refresh_handler, register_handler,
 };
 use handlers::{generate_handler, health_handler};
 use invite_handlers::{
@@ -223,6 +224,12 @@ pub(crate) struct AppState<C: CryptoProvider + Clone> {
     pub(crate) transfer_store: TransferStore,
     /// Per-IP rate limiter для GET /transfer/{code}
     pub(crate) transfer_rate_limiter: TransferRateLimiter,
+    /// WebSocket connection registry (user_id → senders)
+    pub(crate) ws_registry: ConnectionRegistry,
+    /// One-time tickets for secure WS handshake
+    pub(crate) ticket_store: TicketStore,
+    /// Permanent security lock triggered by legitimate user
+    pub(crate) security_lock: SecurityLockStore,
 }
 
 // ════════════════════════════════════════════════════════════════════
@@ -255,6 +262,22 @@ pub async fn run_server(host: &str, port: u16, db_path: String) -> Result<(), Se
         let limiter_clone = transfer_rate_limiter.clone();
         tokio::spawn(async move {
             crate::transfer::cleanup_loop(store_clone, limiter_clone).await;
+        });
+    }
+
+    // WebSocket: connection registry + ticket store + background cleanup
+    let ws_registry = ConnectionRegistry::new();
+    let ticket_store = TicketStore::new();
+    {
+        let registry_clone = ws_registry.clone();
+        let ticket_clone = ticket_store.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
+            loop {
+                interval.tick().await;
+                ticket_clone.cleanup_expired_public();
+                registry_clone.cleanup_dead();
+            }
         });
     }
 
@@ -315,9 +338,20 @@ pub async fn run_server(host: &str, port: u16, db_path: String) -> Result<(), Se
             "/vaults/{vault_id}/entries",
             post(api_push_entries_handler::<RealCrypto>)
                 .get(api_pull_entries_handler::<RealCrypto>),
+        )
+        // Security
+        .route(
+            "/auth/security-lock",
+            post(api_security_lock_handler::<RealCrypto>),
+        )
+        // WebSocket ticket
+        .route(
+            "/ws/ticket",
+            post(crate::ws::ws_ticket_handler::<RealCrypto>),
         );
 
     let app: Router = Router::new()
+        .route("/ws", get(crate::ws::ws_upgrade_handler::<RealCrypto>))
         .route("/health", get(health_handler))
         // Legacy auth routes
         .route("/login", post(login_handler::<RealCrypto>))
@@ -384,6 +418,9 @@ pub async fn run_server(host: &str, port: u16, db_path: String) -> Result<(), Se
             crypto: RealCrypto,
             transfer_store,
             transfer_rate_limiter,
+            ws_registry,
+            ticket_store,
+            security_lock: SecurityLockStore::new(),
         });
 
     #[cfg(feature = "swagger")]

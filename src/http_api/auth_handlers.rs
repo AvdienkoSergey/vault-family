@@ -9,6 +9,7 @@ use crate::crypto_operations::CryptoProvider;
 use crate::shared::SharedDB;
 use crate::types::{Email, EncryptionKey, MasterPassword};
 use crate::vault::{Closed, DB};
+use crate::ws::VaultEvent;
 use axum::Json;
 use axum::extract::State;
 use axum::http::StatusCode;
@@ -352,6 +353,7 @@ pub async fn api_register_handler<C: CryptoProvider + Clone + Send + Sync + 'sta
 /// POST /api/auth/login
 ///
 /// Same as login_handler but returns simplified {user_id, token}.
+/// Returns 423 Locked if the account has a security lock (attacker device → wipe).
 pub async fn api_login_handler<C: CryptoProvider + Clone + Send + Sync + 'static>(
     State(state): State<AppState<C>>,
     Json(body): Json<LoginRequest>,
@@ -361,26 +363,49 @@ pub async fn api_login_handler<C: CryptoProvider + Clone + Send + Sync + 'static
     let jwt_secret = state.jwt_secret.clone();
     let session_store = state.session_store.clone();
     let failed_login_tracker = state.failed_login_tracker.clone();
+    let security_lock = state.security_lock.clone();
+    let ws_registry = state.ws_registry.clone();
     let crypto = state.crypto.clone();
 
-    tokio::task::spawn_blocking(move || {
+    // Result carries either success or (StatusCode, Option<user_id for WS notification>)
+    let result = tokio::task::spawn_blocking(move || {
         let email_str = body.email.clone();
-        let email = Email::parse(body.email).map_err(|_| StatusCode::BAD_REQUEST)?;
+        let email = Email::parse(body.email).map_err(|_| (StatusCode::BAD_REQUEST, None))?;
 
+        // Brute-force lock (temporary, rate-limit based)
         if failed_login_tracker.is_locked(&email_str) {
-            return Err(StatusCode::FORBIDDEN);
+            return Err((StatusCode::FORBIDDEN, None));
         }
 
         let db = DB::<Closed, C>::new(crypto.clone())
             .open(&db_path)
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+            .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, None))?;
 
         let pass = db
             .create_pass(email, MasterPassword::new(body.master_password))
             .map_err(|_| {
                 failed_login_tracker.record_failed_attempt(&email_str);
-                StatusCode::UNAUTHORIZED
+
+                // Wrong password + security lock active → 423 (attacker device wipes itself)
+                if security_lock.is_locked(&email_str) {
+                    return (
+                        StatusCode::from_u16(423).unwrap_or(StatusCode::FORBIDDEN),
+                        None,
+                    );
+                }
+
+                // Wrong password, no lock → 401 + notify legitimate user via WS
+                let notify_user_id = Email::parse(email_str.clone())
+                    .ok()
+                    .and_then(|e| db.find_user_id_by_email(&e).ok());
+                (
+                    StatusCode::UNAUTHORIZED,
+                    notify_user_id.map(|uid| (uid.as_str().to_string(), email_str.clone())),
+                )
             })?;
+
+        // Correct password → always allow, deactivate any security lock
+        security_lock.deactivate(&email_str.to_lowercase());
 
         session_store.insert(
             pass.user_id().as_str(),
@@ -396,7 +421,7 @@ pub async fn api_login_handler<C: CryptoProvider + Clone + Send + Sync + 'static
         }
 
         let access_token = jwt_provider::create_access_token_from_pass(&pass, &jwt_secret)
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+            .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, None))?;
 
         Ok(Json(ApiLoginResponse {
             user_id: pass.user_id().as_str().to_string(),
@@ -404,5 +429,39 @@ pub async fn api_login_handler<C: CryptoProvider + Clone + Send + Sync + 'static
         }))
     })
     .await
-    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    match result {
+        Ok(response) => Ok(response),
+        Err((status, Some((user_id, email)))) => {
+            // Send WS notification to legitimate user about unauthorized attempt
+            let event = VaultEvent::UnauthorizedLoginAttempt {
+                email,
+                timestamp: Utc::now().to_rfc3339(),
+            };
+            if let Ok(json) = serde_json::to_string(&event) {
+                ws_registry.send_to_user(&user_id, &json);
+            }
+            Err(status)
+        }
+        Err((status, None)) => Err(status),
+    }
+}
+
+/// POST /api/auth/security-lock
+///
+/// Activate security lock for the caller's email. Requires JWT auth.
+/// After activation, failed login attempts for this email return 423 (Locked),
+/// signaling the attacker's device to wipe its local data.
+pub async fn api_security_lock_handler<C: CryptoProvider + Clone + Send + Sync + 'static>(
+    State(state): State<AppState<C>>,
+    headers: axum::http::HeaderMap,
+) -> Result<StatusCode, StatusCode> {
+    let pass =
+        auth::guard(&headers, &state.jwt_secret, &state.session_store).map_err(StatusCode::from)?;
+
+    state.security_lock.activate(pass.email().as_str());
+    tracing::warn!("Security lock activated for {}", pass.email().as_str());
+
+    Ok(StatusCode::NO_CONTENT)
 }
