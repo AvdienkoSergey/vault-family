@@ -199,6 +199,49 @@ branded_no_secret!(InviteId); // invites.id
 branded_no_secret!(InviteCodeHash); // SHA-256(6-digit code), хранится в БД
 branded_no_secret!(ConfirmationKey); // HKDF-derived, отправляется invitee
 
+// ════════════════════════════════════════════════════════════════════
+// Branded types — transfer module (in-memory relay)
+// ════════════════════════════════════════════════════════════════════
+
+/// Одноразовый код трансфера в формате NNN-NNN (000-000 .. 999-999).
+///
+/// Пространство кодов = 1 000 000 комбинаций.
+/// Не Serialize/Deserialize — код извлекается из Path, возвращается как String в DTO.
+#[derive(Debug, Clone, Hash, PartialEq, Eq)]
+pub struct TransferCode(String);
+
+impl TransferCode {
+    /// Сгенерировать случайный код NNN-NNN.
+    pub fn generate() -> Self {
+        use rand::RngExt;
+        let mut rng = rand::rng();
+        let a: u16 = rng.random_range(0..1000);
+        let b: u16 = rng.random_range(0..1000);
+        Self(format!("{a:03}-{b:03}"))
+    }
+
+    /// Распарсить и валидировать пользовательский ввод.
+    /// Принимает только формат NNN-NNN (ровно 7 символов, цифры и дефис).
+    pub fn parse(input: &str) -> Option<Self> {
+        let s = input.trim();
+        if s.len() != 7 {
+            return None;
+        }
+        let (left, right) = s.split_once('-')?;
+        if left.len() != 3 || right.len() != 3 {
+            return None;
+        }
+        if !left.bytes().all(|b| b.is_ascii_digit()) || !right.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        Some(Self(s.to_string()))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
 /// Права доступа участника в shared vault
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum VaultPermission {
