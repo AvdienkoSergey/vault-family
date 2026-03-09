@@ -57,6 +57,8 @@ impl TestApp {
             session_store: SessionStore::new(),
             failed_login_tracker: FailedLoginTracker::new(),
             crypto: FakeCrypto,
+            transfer_store: crate::transfer::TransferStore::new(),
+            transfer_rate_limiter: crate::transfer::TransferRateLimiter::new(),
         };
 
         let api_routes: Router<AppState<FakeCrypto>> = Router::new()

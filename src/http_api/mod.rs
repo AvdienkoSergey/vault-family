@@ -3,6 +3,7 @@ mod dto;
 mod handlers;
 mod invite_handlers;
 mod shared_vault_handlers;
+mod transfer_handlers;
 mod vault_handlers;
 
 #[cfg(test)]
@@ -17,12 +18,14 @@ use tower_http::trace::{DefaultMakeSpan, DefaultOnRequest, DefaultOnResponse, Tr
 use tracing::Level;
 use tracing_subscriber::EnvFilter;
 
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 use crate::auth;
 use crate::auth::{FailedLoginTracker, JwtSecret, SessionStore};
 use crate::crypto_operations::{CryptoProvider, RealCrypto};
 use crate::shared;
+use crate::transfer::{TransferRateLimiter, TransferStore};
 
 use auth_handlers::{
     api_login_handler, api_register_handler, login_handler, logout_handler, refresh_handler,
@@ -51,6 +54,7 @@ use shared_vault_handlers::{
     revoke_member_handler,
     update_permission_handler,
 };
+use transfer_handlers::{transfer_download_handler, transfer_upload_handler};
 use vault_handlers::{add_handler, delete_handler, list_handler, view_handler};
 
 // ════════════════════════════════════════════════════════════════════
@@ -119,6 +123,9 @@ mod swagger {
             super::invite_handlers::accept_invite_handler,
             super::invite_handlers::get_accepted_invites_handler,
             super::invite_handlers::complete_invite_handler,
+            // Transfer (anonymous relay)
+            super::transfer_handlers::transfer_upload_handler,
+            super::transfer_handlers::transfer_download_handler,
         ),
         components(schemas(
             dto::RegisterRequest,
@@ -153,6 +160,10 @@ mod swagger {
             dto::ApiEncryptedEntryItem,
             dto::PushEntriesRequest,
             dto::PullEntriesQuery,
+            // Transfer DTOs
+            dto::TransferUploadRequest,
+            dto::TransferUploadResponse,
+            dto::TransferDownloadResponse,
         )),
         modifiers(&SecurityAddon),
         tags(
@@ -163,6 +174,7 @@ mod swagger {
             (name = "Invites", description = "4-step invitation flow"),
             (name = "Members", description = "Shared vault member management"),
             (name = "Entries", description = "Encrypted entry storage (zero-knowledge)"),
+            (name = "Transfer", description = "Anonymous encrypted archive relay (in-memory)"),
         )
     )]
     pub struct ApiDoc;
@@ -207,6 +219,10 @@ pub(crate) struct AppState<C: CryptoProvider + Clone> {
     pub(crate) failed_login_tracker: FailedLoginTracker,
     /// Криптопровайдер
     pub(crate) crypto: C,
+    /// In-memory хранилище трансферов (зашифрованные архивы, TTL ≤ 15 мин)
+    pub(crate) transfer_store: TransferStore,
+    /// Per-IP rate limiter для GET /transfer/{code}
+    pub(crate) transfer_rate_limiter: TransferRateLimiter,
 }
 
 // ════════════════════════════════════════════════════════════════════
@@ -230,6 +246,17 @@ pub async fn run_server(host: &str, port: u16, db_path: String) -> Result<(), Se
         )
         .compact()
         .init();
+
+    // Transfer: in-memory store + rate limiter + background cleanup
+    let transfer_store = TransferStore::new();
+    let transfer_rate_limiter = TransferRateLimiter::new();
+    {
+        let store_clone = transfer_store.clone();
+        let limiter_clone = transfer_rate_limiter.clone();
+        tokio::spawn(async move {
+            crate::transfer::cleanup_loop(store_clone, limiter_clone).await;
+        });
+    }
 
     // New /api/* routes (zero-knowledge relay for mobile frontend)
     let api_routes: Router<AppState<RealCrypto>> = Router::new()
@@ -328,6 +355,12 @@ pub async fn run_server(host: &str, port: u16, db_path: String) -> Result<(), Se
             "/shared-vaults/{vault_id}/members/{user_id}",
             patch(update_permission_handler::<RealCrypto>),
         )
+        // Transfer (anonymous, no auth)
+        .route("/transfer", post(transfer_upload_handler::<RealCrypto>))
+        .route(
+            "/transfer/{code}",
+            get(transfer_download_handler::<RealCrypto>),
+        )
         // Mount new API routes
         .nest("/api", api_routes)
         .layer(
@@ -349,6 +382,8 @@ pub async fn run_server(host: &str, port: u16, db_path: String) -> Result<(), Se
             session_store: SessionStore::new(),
             failed_login_tracker: FailedLoginTracker::new(),
             crypto: RealCrypto,
+            transfer_store,
+            transfer_rate_limiter,
         });
 
     #[cfg(feature = "swagger")]
@@ -372,9 +407,12 @@ pub async fn run_server(host: &str, port: u16, db_path: String) -> Result<(), Se
 
     println!("Server started at http://{}:{}", host, port);
 
-    axum::serve(listener, app)
-        .await
-        .map_err(|e| ServerError::Connection(format!("Unable to start server: {}", e)))?;
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await
+    .map_err(|e| ServerError::Connection(format!("Unable to start server: {}", e)))?;
 
     Ok(())
 }

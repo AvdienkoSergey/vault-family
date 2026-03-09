@@ -331,3 +331,29 @@ fn default_true() -> bool {
 pub struct GenerateResponse {
     pub password: String,
 }
+
+// ════════════════════════════════════════════════════════════════════
+// Transfer (анонимный in-memory relay)
+// ════════════════════════════════════════════════════════════════════
+
+#[derive(Deserialize)]
+#[cfg_attr(feature = "swagger", derive(utoipa::ToSchema))]
+pub struct TransferUploadRequest {
+    pub payload: String,
+    pub ttl_minutes: u64,
+    pub copies: u32,
+}
+
+#[derive(Serialize)]
+#[cfg_attr(feature = "swagger", derive(utoipa::ToSchema))]
+pub struct TransferUploadResponse {
+    pub code: String,
+    pub expires_at: String,
+    pub copies: u32,
+}
+
+#[derive(Serialize)]
+#[cfg_attr(feature = "swagger", derive(utoipa::ToSchema))]
+pub struct TransferDownloadResponse {
+    pub payload: String,
+}
