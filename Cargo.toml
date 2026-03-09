@@ -3,7 +3,7 @@ members = ["crates/vault-crypto-wasm", "tools/file-stats"]
 
 [package]
 name = "vault-family"
-version = "0.1.8"
+version = "0.1.9"
 edition = "2024"
 
 [features]
