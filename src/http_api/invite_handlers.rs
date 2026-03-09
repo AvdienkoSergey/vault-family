@@ -201,6 +201,7 @@ pub async fn complete_invite_handler<C: CryptoProvider + Clone + Send + Sync + '
                 pass.user_id(),
                 &body.encrypted_vault_key,
                 &body.nonce,
+                &body.sender_public_key,
             )
             .map_err(|e| shared_error_to_status(&e))?;
 

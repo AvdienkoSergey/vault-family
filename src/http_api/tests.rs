@@ -9,9 +9,9 @@ use super::invite_handlers::{
     list_my_invites_handler, send_invite_handler,
 };
 use super::shared_vault_handlers::{
-    api_create_vault_handler, api_delete_vault_handler, api_list_members_handler,
-    api_list_vaults_handler, api_pull_entries_handler, api_push_entries_handler,
-    api_revoke_member_handler, api_update_keys_handler,
+    api_create_vault_handler, api_delete_vault_handler, api_get_my_key_handler,
+    api_list_members_handler, api_list_vaults_handler, api_pull_entries_handler,
+    api_push_entries_handler, api_revoke_member_handler, api_update_keys_handler,
 };
 use super::vault_handlers::{add_handler, delete_handler, list_handler, view_handler};
 use crate::auth;
@@ -99,6 +99,10 @@ impl TestApp {
             .route(
                 "/vaults/{vault_id}/keys",
                 put(api_update_keys_handler::<FakeCrypto>),
+            )
+            .route(
+                "/vaults/{vault_id}/my-key",
+                get(api_get_my_key_handler::<FakeCrypto>),
             )
             .route(
                 "/vaults/{vault_id}/entries",

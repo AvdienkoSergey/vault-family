@@ -150,6 +150,67 @@ impl<C: CryptoProvider> SharedDB<C> {
         }
     }
 
+    /// Get the encrypted vault key for a specific member.
+    /// Returns (encrypted_vault_key, nonce, sender_public_key).
+    pub fn get_member_encrypted_key(
+        &self,
+        user_id: &UserId,
+        vault_id: &SharedVaultId,
+    ) -> Result<(String, String, String), SharedError> {
+        // Verify caller is a member
+        if !self.is_member(vault_id, user_id)? {
+            return Err(SharedError::Forbidden("not a member".to_string()));
+        }
+
+        let row = self
+            .conn
+            .query_row(
+                "SELECT encrypted_vault_key, vault_key_nonce, ephemeral_public_key
+                 FROM shared_vault_members WHERE vault_id = ?1 AND user_id = ?2",
+                params![vault_id.as_str(), user_id.as_str()],
+                |row| {
+                    let key: String = row.get(0)?;
+                    let nonce: String = row.get(1)?;
+                    let sender_pk: String = row.get(2)?;
+                    Ok((key, nonce, sender_pk))
+                },
+            )
+            .map_err(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => {
+                    SharedError::NotFound("member key not found".to_string())
+                }
+                _ => SharedError::Database(e.to_string()),
+            })?;
+
+        if row.0.is_empty() {
+            return Err(SharedError::NotFound(
+                "vault key not yet available".to_string(),
+            ));
+        }
+
+        Ok(row)
+    }
+
+    /// Get the owner's user_id for a vault.
+    #[allow(dead_code)]
+    pub fn get_vault_owner_id(&self, vault_id: &SharedVaultId) -> Result<UserId, SharedError> {
+        let owner: String = self
+            .conn
+            .query_row(
+                "SELECT owner_id FROM shared_vaults WHERE id = ?1",
+                params![vault_id.as_str()],
+                |row| row.get(0),
+            )
+            .map_err(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => {
+                    SharedError::NotFound("vault not found".to_string())
+                }
+                _ => SharedError::Database(e.to_string()),
+            })?;
+
+        Ok(UserId::new(owner))
+    }
+
     /// List members of a shared vault (any member can see).
     /// Returns expanded data including email (from vault.db lookup done at handler level),
     /// public_key, and role.

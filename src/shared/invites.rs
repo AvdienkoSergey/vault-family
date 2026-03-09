@@ -90,7 +90,7 @@ impl<C: CryptoProvider> SharedDB<C> {
                         i.status, i.created_at, i.updated_at, sv.name
                  FROM invites i
                  LEFT JOIN shared_vaults sv ON sv.id = i.vault_id
-                 WHERE i.inviter_id = ?1 OR i.invitee_email = ?2
+                 WHERE i.invitee_email = ?2
                  ORDER BY i.created_at DESC",
             )
             .map_err(|e| SharedError::Database(e.to_string()))?;
@@ -259,6 +259,7 @@ impl<C: CryptoProvider> SharedDB<C> {
         inviter_id: &UserId,
         encrypted_vault_key: &str,
         nonce: &str,
+        sender_public_key: &str,
     ) -> Result<(), SharedError> {
         // Verify invite exists, is accepted, and caller is the inviter
         let row = self
@@ -318,13 +319,14 @@ impl<C: CryptoProvider> SharedDB<C> {
             // Insert member into shared_vault_members
             self.conn
                 .execute(
-                    "INSERT OR IGNORE INTO shared_vault_members (vault_id, user_id, encrypted_vault_key, vault_key_nonce, role, permission, invited_at)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    "INSERT OR IGNORE INTO shared_vault_members (vault_id, user_id, encrypted_vault_key, vault_key_nonce, ephemeral_public_key, role, permission, invited_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                     params![
                         &vault_id,
                         &invitee_uid,
                         encrypted_vault_key,
                         nonce,
+                        sender_public_key,
                         &role,
                         &permission,
                         &now,

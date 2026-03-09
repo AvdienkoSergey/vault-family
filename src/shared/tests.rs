@@ -48,6 +48,7 @@ fn setup_vault_with_member(
         owner.user_id(),
         "encrypted_vault_key_hex",
         "nonce_hex",
+        "owner_pub_key_hex",
     )
     .unwrap();
 
@@ -203,7 +204,7 @@ fn invite_limit_5_members() {
         let member_uid = UserId::new(uid);
         db.accept_invite(&invite_id, &member_uid, "pk", "ck")
             .unwrap();
-        db.complete_invite(&invite_id, owner_pass.user_id(), "evk", "n")
+        db.complete_invite(&invite_id, owner_pass.user_id(), "evk", "n", "opk")
             .unwrap();
     }
 

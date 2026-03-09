@@ -205,6 +205,8 @@ pub struct AcceptInviteRequest {
 pub struct CompleteInviteRequest {
     pub encrypted_vault_key: String,
     pub nonce: String,
+    #[serde(default)]
+    pub sender_public_key: String,
 }
 
 #[derive(Serialize)]
@@ -256,6 +258,18 @@ pub struct MemberKeyUpdateItem {
 #[cfg_attr(feature = "swagger", derive(utoipa::ToSchema))]
 pub struct UpdateMemberKeysRequest {
     pub members: Vec<MemberKeyUpdateItem>,
+}
+
+// ════════════════════════════════════════════════════════════════════
+// API — Member vault key
+// ════════════════════════════════════════════════════════════════════
+
+#[derive(Serialize)]
+#[cfg_attr(feature = "swagger", derive(utoipa::ToSchema))]
+pub struct ApiMyKeyResponse {
+    pub encrypted_vault_key: String,
+    pub nonce: String,
+    pub owner_public_key_hex: String,
 }
 
 // ════════════════════════════════════════════════════════════════════

@@ -36,6 +36,7 @@ use invite_handlers::{
 use shared_vault_handlers::{
     api_create_vault_handler,
     api_delete_vault_handler,
+    api_get_my_key_handler,
     api_list_members_handler,
     api_list_vaults_handler,
     api_pull_entries_handler,
@@ -276,6 +277,11 @@ pub async fn run_server(host: &str, port: u16, db_path: String) -> Result<(), Se
         .route(
             "/vaults/{vault_id}/keys",
             put(api_update_keys_handler::<RealCrypto>),
+        )
+        // Member vault key
+        .route(
+            "/vaults/{vault_id}/my-key",
+            get(api_get_my_key_handler::<RealCrypto>),
         )
         // Entries (zero-knowledge)
         .route(

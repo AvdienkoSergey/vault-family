@@ -1,8 +1,9 @@
 use super::AppState;
 use super::dto::{
-    ApiEncryptedEntryItem, ApiMemberItem, ApiSharedVaultItem, CreateSharedVaultRequest,
-    CreateSharedVaultResponse, DeleteResponse, MemberListItem, PullEntriesQuery,
-    PushEntriesRequest, SharedVaultListItem, UpdateMemberKeysRequest, UpdatePermissionRequest,
+    ApiEncryptedEntryItem, ApiMemberItem, ApiMyKeyResponse, ApiSharedVaultItem,
+    CreateSharedVaultRequest, CreateSharedVaultResponse, DeleteResponse, MemberListItem,
+    PullEntriesQuery, PushEntriesRequest, SharedVaultListItem, UpdateMemberKeysRequest,
+    UpdatePermissionRequest,
 };
 use crate::auth;
 use crate::crypto_operations::CryptoProvider;
@@ -230,6 +231,39 @@ pub async fn api_update_keys_handler<C: CryptoProvider + Clone + Send + Sync + '
             .map_err(|e| shared_error_to_status(&e))?;
 
         Ok(StatusCode::NO_CONTENT)
+    })
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+}
+
+/// GET /api/vaults/{vault_id}/my-key — get own encrypted vault key
+pub async fn api_get_my_key_handler<C: CryptoProvider + Clone + Send + Sync + 'static>(
+    State(state): State<AppState<C>>,
+    headers: axum::http::HeaderMap,
+    Path(vault_id): Path<String>,
+) -> Result<Json<ApiMyKeyResponse>, StatusCode> {
+    let shared_db_path = state.shared_db_path.clone();
+    let jwt_secret = state.jwt_secret.clone();
+    let session_store = state.session_store.clone();
+    let crypto = state.crypto.clone();
+
+    tokio::task::spawn_blocking(move || {
+        let pass = auth::guard(&headers, &jwt_secret, &session_store).map_err(StatusCode::from)?;
+
+        let shared_db = SharedDB::open(&shared_db_path, crypto)
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+        let vid = SharedVaultId::new(vault_id);
+
+        let (encrypted_key, nonce, sender_pub_key) = shared_db
+            .get_member_encrypted_key(pass.user_id(), &vid)
+            .map_err(|e| shared_error_to_status(&e))?;
+
+        Ok(Json(ApiMyKeyResponse {
+            encrypted_vault_key: encrypted_key,
+            nonce,
+            owner_public_key_hex: sender_pub_key,
+        }))
     })
     .await
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
