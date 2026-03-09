@@ -244,6 +244,33 @@ impl<C: CryptoProvider> DB<Open, C> {
         Ok(VaultPass::new(user.id, user.email, key))
     }
 
+    /// Update master password hash for an existing user.
+    ///
+    /// Called after password change from a trusted device.
+    /// Only updates `master_hash` and `auth_salt` — `encryption_salt` stays the same
+    /// so the derived encryption key doesn't change (vault_key is re-wrapped on client).
+    pub fn update_password(
+        &self,
+        email: &Email,
+        new_password: MasterPassword,
+    ) -> Result<(), VaultError> {
+        let crypto = &self.crypto;
+        let (new_hash, new_salt) = crypto.hash_master_password(&new_password)?;
+
+        let rows = self
+            .conn
+            .execute(
+                "UPDATE users SET master_hash = ?1, auth_salt = ?2 WHERE email = ?3",
+                (new_hash.as_str(), new_salt.as_str(), email.as_str()),
+            )
+            .map_err(|e| VaultError::Database(format!("Failed to update password: {e}")))?;
+
+        if rows == 0 {
+            return Err(VaultError::Database("User not found".to_string()));
+        }
+        Ok(())
+    }
+
     /// Look up user by email → UserId (needed for invite by email in shared vaults).
     /// Read-only query, does not require authentication.
     pub fn find_user_id_by_email(&self, email: &Email) -> Result<UserId, VaultError> {

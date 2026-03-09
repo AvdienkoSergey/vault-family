@@ -194,6 +194,53 @@ branded_no_secret!(EphemeralPublicKey); // ephemeral X25519 public для DH
 // --- Вне БД: живут только в памяти (shared vault crypto) ---
 branded_secret!(SharedVaultKey); // расшифрованный 32-byte ключ shared vault
 branded_secret!(UserPrivateKey); // расшифрованный X25519 private key
+// --- TABLE invites (shared.db) ---
+branded_no_secret!(InviteId); // invites.id
+branded_no_secret!(InviteCodeHash); // SHA-256(6-digit code), хранится в БД
+branded_no_secret!(ConfirmationKey); // HKDF-derived, отправляется invitee
+
+// ════════════════════════════════════════════════════════════════════
+// Branded types — transfer module (in-memory relay)
+// ════════════════════════════════════════════════════════════════════
+
+/// Одноразовый код трансфера в формате NNN-NNN (000-000 .. 999-999).
+///
+/// Пространство кодов = 1 000 000 комбинаций.
+/// Не Serialize/Deserialize — код извлекается из Path, возвращается как String в DTO.
+#[derive(Debug, Clone, Hash, PartialEq, Eq)]
+pub struct TransferCode(String);
+
+impl TransferCode {
+    /// Сгенерировать случайный код NNN-NNN.
+    pub fn generate() -> Self {
+        use rand::RngExt;
+        let mut rng = rand::rng();
+        let a: u16 = rng.random_range(0..1000);
+        let b: u16 = rng.random_range(0..1000);
+        Self(format!("{a:03}-{b:03}"))
+    }
+
+    /// Распарсить и валидировать пользовательский ввод.
+    /// Принимает только формат NNN-NNN (ровно 7 символов, цифры и дефис).
+    pub fn parse(input: &str) -> Option<Self> {
+        let s = input.trim();
+        if s.len() != 7 {
+            return None;
+        }
+        let (left, right) = s.split_once('-')?;
+        if left.len() != 3 || right.len() != 3 {
+            return None;
+        }
+        if !left.bytes().all(|b| b.is_ascii_digit()) || !right.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        Some(Self(s.to_string()))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
 
 /// Права доступа участника в shared vault
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -215,6 +262,66 @@ impl VaultPermission {
             "read" => Ok(VaultPermission::Read),
             "readwrite" => Ok(VaultPermission::ReadWrite),
             other => Err(format!("unknown permission: {other}")),
+        }
+    }
+}
+
+/// Роль участника в shared vault (owner/editor/viewer)
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum Role {
+    Owner,
+    Editor,
+    Viewer,
+}
+
+impl Role {
+    pub fn as_str(&self) -> &str {
+        match self {
+            Role::Owner => "owner",
+            Role::Editor => "editor",
+            Role::Viewer => "viewer",
+        }
+    }
+
+    pub fn from_str_role(s: &str) -> Result<Self, String> {
+        match s {
+            "owner" => Ok(Role::Owner),
+            "editor" => Ok(Role::Editor),
+            "viewer" => Ok(Role::Viewer),
+            other => Err(format!("unknown role: {other}")),
+        }
+    }
+}
+
+/// Статус приглашения в shared vault
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum InviteStatus {
+    Pending,
+    Accepted,
+    Completed,
+    Rejected,
+    Expired,
+}
+
+impl InviteStatus {
+    pub fn as_str(&self) -> &str {
+        match self {
+            InviteStatus::Pending => "pending",
+            InviteStatus::Accepted => "accepted",
+            InviteStatus::Completed => "completed",
+            InviteStatus::Rejected => "rejected",
+            InviteStatus::Expired => "expired",
+        }
+    }
+
+    pub fn from_str_status(s: &str) -> Result<Self, String> {
+        match s {
+            "pending" => Ok(InviteStatus::Pending),
+            "accepted" => Ok(InviteStatus::Accepted),
+            "completed" => Ok(InviteStatus::Completed),
+            "rejected" => Ok(InviteStatus::Rejected),
+            "expired" => Ok(InviteStatus::Expired),
+            other => Err(format!("unknown invite status: {other}")),
         }
     }
 }
@@ -309,9 +416,36 @@ pub struct SharedEncryptedEntry {
     pub vault_id: SharedVaultId,
     pub encrypted_data: EncryptedData,
     pub nonce: Nonce,
+    pub category: String,
     pub created_by: UserId,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    pub deleted: bool,
+}
+
+/// Приглашение в shared vault — строка из TABLE invites
+#[derive(Debug, Clone)]
+pub struct Invite {
+    pub id: InviteId,
+    pub vault_id: SharedVaultId,
+    pub inviter_id: UserId,
+    pub invitee_email: String,
+    pub role: Role,
+    pub permission: VaultPermission,
+    pub status: InviteStatus,
+    pub vault_name: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+/// Принятое приглашение (ожидает complete от inviter)
+#[derive(Debug, Clone)]
+pub struct AcceptedInvite {
+    pub invite_id: InviteId,
+    pub user_id: UserId,
+    pub email: String,
+    pub public_key_hex: String,
+    pub confirmation_key_hex: String,
 }
 // ════════════════════════════════════════════════════════════════════
 // VaultPass — Пропуск между Вахтером (auth) и Хранилищем (vault)

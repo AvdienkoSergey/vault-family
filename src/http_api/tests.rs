@@ -1,6 +1,18 @@
 use super::AppState;
-use super::auth_handlers::{login_handler, logout_handler, refresh_handler, register_handler};
+use super::auth_handlers::{
+    api_login_handler, api_register_handler, login_handler, logout_handler, refresh_handler,
+    register_handler,
+};
 use super::handlers::{generate_handler, health_handler};
+use super::invite_handlers::{
+    accept_invite_handler, complete_invite_handler, get_accepted_invites_handler,
+    list_my_invites_handler, send_invite_handler,
+};
+use super::shared_vault_handlers::{
+    api_create_vault_handler, api_delete_vault_handler, api_get_my_key_handler,
+    api_list_members_handler, api_list_vaults_handler, api_pull_entries_handler,
+    api_push_entries_handler, api_revoke_member_handler, api_update_keys_handler,
+};
 use super::vault_handlers::{add_handler, delete_handler, list_handler, view_handler};
 use crate::auth;
 use crate::auth::{FailedLoginTracker, JwtSecret, SessionStore};
@@ -9,7 +21,7 @@ use crate::shared;
 use axum::Router;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
-use axum::routing::{delete as delete_method, get, post};
+use axum::routing::{delete as delete_method, get, post, put};
 use http_body_util::BodyExt;
 use std::sync::Arc;
 use tower::ServiceExt;
@@ -45,7 +57,64 @@ impl TestApp {
             session_store: SessionStore::new(),
             failed_login_tracker: FailedLoginTracker::new(),
             crypto: FakeCrypto,
+            transfer_store: crate::transfer::TransferStore::new(),
+            transfer_rate_limiter: crate::transfer::TransferRateLimiter::new(),
+            ws_registry: crate::ws::ConnectionRegistry::new(),
+            ticket_store: crate::ws::TicketStore::new(),
+            security_lock: crate::auth::SecurityLockStore::new(),
+            device_trust: crate::auth::DeviceTrustStore::new(),
         };
+
+        let api_routes: Router<AppState<FakeCrypto>> = Router::new()
+            .route("/auth/register", post(api_register_handler::<FakeCrypto>))
+            .route("/auth/login", post(api_login_handler::<FakeCrypto>))
+            .route(
+                "/vaults",
+                post(api_create_vault_handler::<FakeCrypto>)
+                    .get(api_list_vaults_handler::<FakeCrypto>),
+            )
+            .route(
+                "/vaults/{vault_id}",
+                delete_method(api_delete_vault_handler::<FakeCrypto>),
+            )
+            .route(
+                "/vaults/{vault_id}/invites",
+                post(send_invite_handler::<FakeCrypto>),
+            )
+            .route(
+                "/vaults/{vault_id}/invites/accepted",
+                get(get_accepted_invites_handler::<FakeCrypto>),
+            )
+            .route("/invites", get(list_my_invites_handler::<FakeCrypto>))
+            .route(
+                "/invites/{invite_id}/accept",
+                post(accept_invite_handler::<FakeCrypto>),
+            )
+            .route(
+                "/invites/{invite_id}/complete",
+                post(complete_invite_handler::<FakeCrypto>),
+            )
+            .route(
+                "/vaults/{vault_id}/members",
+                get(api_list_members_handler::<FakeCrypto>),
+            )
+            .route(
+                "/vaults/{vault_id}/members/{user_id}",
+                delete_method(api_revoke_member_handler::<FakeCrypto>),
+            )
+            .route(
+                "/vaults/{vault_id}/keys",
+                put(api_update_keys_handler::<FakeCrypto>),
+            )
+            .route(
+                "/vaults/{vault_id}/my-key",
+                get(api_get_my_key_handler::<FakeCrypto>),
+            )
+            .route(
+                "/vaults/{vault_id}/entries",
+                post(api_push_entries_handler::<FakeCrypto>)
+                    .get(api_pull_entries_handler::<FakeCrypto>),
+            );
 
         let router = Router::new()
             .route("/health", get(health_handler))
@@ -58,6 +127,7 @@ impl TestApp {
             .route("/view/{id}", get(view_handler::<FakeCrypto>))
             .route("/delete/{id}", delete_method(delete_handler::<FakeCrypto>))
             .route("/generate", get(generate_handler))
+            .nest("/api", api_routes)
             .with_state(state);
 
         Self {
@@ -601,7 +671,8 @@ async fn login_locked_after_max_attempts() {
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }
 
-    // Следующая попытка (даже с ПРАВИЛЬНЫМ паролем) → 403
+    // Next attempt (even correct password) → 403 (no PBKDF2 executed)
+    // Lock expires after FAILED_ATTEMPTS_WINDOW_SECS (5 min)
     let req = Request::builder()
         .method("POST")
         .uri("/login")
@@ -612,4 +683,894 @@ async fn login_locked_after_max_attempts() {
         .unwrap();
     let resp = app.request(req).await;
     assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+}
+
+// ════════════════════════════════════════════
+// API helpers
+// ════════════════════════════════════════════
+
+/// Регистрация + логин через /api/auth/ — возвращает (user_id, token)
+async fn api_register_and_login(app: &TestApp, email: &str, password: &str) -> (String, String) {
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/auth/register")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::json!({
+                "email": email,
+                "master_password": password,
+                "public_key": "aa".repeat(32),
+            })
+            .to_string(),
+        ))
+        .unwrap();
+    let resp = app.request(req).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp).await;
+    (
+        json["user_id"].as_str().unwrap().to_string(),
+        json["token"].as_str().unwrap().to_string(),
+    )
+}
+
+/// Создание shared vault — возвращает vault_id
+async fn api_create_vault(app: &TestApp, token: &str, name: &str) -> String {
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/vaults")
+        .header("content-type", "application/json")
+        .header("authorization", format!("Bearer {token}"))
+        .body(Body::from(serde_json::json!({ "name": name }).to_string()))
+        .unwrap();
+    let resp = app.request(req).await;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let json = body_json(resp).await;
+    json["vault_id"].as_str().unwrap().to_string()
+}
+
+/// Полный 4-шаговый invite flow, возвращает invite_id
+async fn api_full_invite(
+    app: &TestApp,
+    owner_token: &str,
+    vault_id: &str,
+    invitee_email: &str,
+    invitee_token: &str,
+) -> String {
+    // 1. Send invite
+    let req = Request::builder()
+        .method("POST")
+        .uri(format!("/api/vaults/{vault_id}/invites"))
+        .header("content-type", "application/json")
+        .header("authorization", format!("Bearer {owner_token}"))
+        .body(Body::from(
+            serde_json::json!({
+                "email": invitee_email,
+                "role": "viewer",
+                "permission": "read",
+            })
+            .to_string(),
+        ))
+        .unwrap();
+    let resp = app.request(req).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp).await;
+    let invite_id = json["invite_id"].as_str().unwrap().to_string();
+
+    // 2. Accept invite
+    let req = Request::builder()
+        .method("POST")
+        .uri(format!("/api/invites/{invite_id}/accept"))
+        .header("content-type", "application/json")
+        .header("authorization", format!("Bearer {invitee_token}"))
+        .body(Body::from(
+            serde_json::json!({
+                "public_key": "cc".repeat(32),
+                "confirmation_key": "dd".repeat(32),
+            })
+            .to_string(),
+        ))
+        .unwrap();
+    let resp = app.request(req).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // 3. Complete invite (owner)
+    let req = Request::builder()
+        .method("POST")
+        .uri(format!("/api/invites/{invite_id}/complete"))
+        .header("content-type", "application/json")
+        .header("authorization", format!("Bearer {owner_token}"))
+        .body(Body::from(
+            serde_json::json!({
+                "encrypted_vault_key": "ee".repeat(32),
+                "nonce": "ff".repeat(12),
+            })
+            .to_string(),
+        ))
+        .unwrap();
+    let resp = app.request(req).await;
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+    invite_id
+}
+
+// ════════════════════════════════════════════
+// API Auth
+// ════════════════════════════════════════════
+
+#[tokio::test]
+async fn api_register_returns_user_id_and_token() {
+    let app = TestApp::new();
+    let (user_id, token) = api_register_and_login(&app, "alice@example.com", "Secret123!").await;
+    assert!(!user_id.is_empty());
+    assert!(!token.is_empty());
+}
+
+#[tokio::test]
+async fn api_register_invalid_email_returns_400() {
+    let app = TestApp::new();
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/auth/register")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            r#"{"email":"bad","master_password":"S123!","public_key":"aa"}"#,
+        ))
+        .unwrap();
+    let resp = app.request(req).await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn api_login_returns_user_id_and_token() {
+    let app = TestApp::new();
+    api_register_and_login(&app, "alice@example.com", "Secret123!").await;
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/auth/login")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            r#"{"email":"alice@example.com","master_password":"Secret123!"}"#,
+        ))
+        .unwrap();
+    let resp = app.request(req).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp).await;
+    assert!(!json["user_id"].as_str().unwrap().is_empty());
+    assert!(!json["token"].as_str().unwrap().is_empty());
+}
+
+// ════════════════════════════════════════════
+// Shared Vaults CRUD
+// ════════════════════════════════════════════
+
+#[tokio::test]
+async fn api_create_vault_returns_vault_id() {
+    let app = TestApp::new();
+    let (_, token) = api_register_and_login(&app, "alice@example.com", "Secret123!").await;
+    let vault_id = api_create_vault(&app, &token, "Family").await;
+    assert!(!vault_id.is_empty());
+}
+
+#[tokio::test]
+async fn api_list_vaults_returns_owned() {
+    let app = TestApp::new();
+    let (_, token) = api_register_and_login(&app, "alice@example.com", "Secret123!").await;
+    api_create_vault(&app, &token, "Family").await;
+
+    let req = Request::builder()
+        .uri("/api/vaults")
+        .header("authorization", format!("Bearer {token}"))
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.request(req).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp).await;
+    let vaults = json.as_array().unwrap();
+    assert_eq!(vaults.len(), 1);
+    assert_eq!(vaults[0]["name"], "Family");
+    assert_eq!(vaults[0]["member_count"], 1);
+    assert_eq!(vaults[0]["entry_count"], 0);
+}
+
+#[tokio::test]
+async fn api_list_vaults_empty_for_new_user() {
+    let app = TestApp::new();
+    let (_, token) = api_register_and_login(&app, "alice@example.com", "Secret123!").await;
+
+    let req = Request::builder()
+        .uri("/api/vaults")
+        .header("authorization", format!("Bearer {token}"))
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.request(req).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp).await;
+    assert_eq!(json.as_array().unwrap().len(), 0);
+}
+
+#[tokio::test]
+async fn api_create_vault_without_auth_returns_401() {
+    let app = TestApp::new();
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/vaults")
+        .header("content-type", "application/json")
+        .body(Body::from(r#"{"name":"X"}"#))
+        .unwrap();
+    let resp = app.request(req).await;
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn api_delete_vault_owner_only() {
+    let app = TestApp::new();
+    let (_, owner_token) = api_register_and_login(&app, "alice@example.com", "Secret123!").await;
+    let (_, other_token) = api_register_and_login(&app, "bob@example.com", "Secret123!").await;
+    let vault_id = api_create_vault(&app, &owner_token, "Family").await;
+
+    // Non-owner → 403
+    let req = Request::builder()
+        .method("DELETE")
+        .uri(format!("/api/vaults/{vault_id}"))
+        .header("authorization", format!("Bearer {other_token}"))
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.request(req).await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+    // Owner → 204
+    let req = Request::builder()
+        .method("DELETE")
+        .uri(format!("/api/vaults/{vault_id}"))
+        .header("authorization", format!("Bearer {owner_token}"))
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.request(req).await;
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+}
+
+// ════════════════════════════════════════════
+// 4-Step Invite Flow
+// ════════════════════════════════════════════
+
+#[tokio::test]
+async fn api_send_invite_returns_code() {
+    let app = TestApp::new();
+    let (_, token) = api_register_and_login(&app, "alice@example.com", "Secret123!").await;
+    let vault_id = api_create_vault(&app, &token, "Family").await;
+
+    let req = Request::builder()
+        .method("POST")
+        .uri(format!("/api/vaults/{vault_id}/invites"))
+        .header("content-type", "application/json")
+        .header("authorization", format!("Bearer {token}"))
+        .body(Body::from(
+            r#"{"email":"bob@example.com","role":"viewer","permission":"read"}"#,
+        ))
+        .unwrap();
+    let resp = app.request(req).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp).await;
+    assert!(!json["invite_id"].as_str().unwrap().is_empty());
+    assert!(!json["code"].as_str().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn api_send_invite_non_owner_forbidden() {
+    let app = TestApp::new();
+    let (_, owner_token) = api_register_and_login(&app, "alice@example.com", "Secret123!").await;
+    let (_, other_token) = api_register_and_login(&app, "bob@example.com", "Secret123!").await;
+    let vault_id = api_create_vault(&app, &owner_token, "Family").await;
+
+    let req = Request::builder()
+        .method("POST")
+        .uri(format!("/api/vaults/{vault_id}/invites"))
+        .header("content-type", "application/json")
+        .header("authorization", format!("Bearer {other_token}"))
+        .body(Body::from(
+            r#"{"email":"carol@example.com","role":"viewer","permission":"read"}"#,
+        ))
+        .unwrap();
+    let resp = app.request(req).await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn api_list_my_invites() {
+    let app = TestApp::new();
+    let (_, owner_token) = api_register_and_login(&app, "alice@example.com", "Secret123!").await;
+    let (_, bob_token) = api_register_and_login(&app, "bob@example.com", "Secret123!").await;
+    let vault_id = api_create_vault(&app, &owner_token, "Family").await;
+
+    // Send invite to bob
+    let req = Request::builder()
+        .method("POST")
+        .uri(format!("/api/vaults/{vault_id}/invites"))
+        .header("content-type", "application/json")
+        .header("authorization", format!("Bearer {owner_token}"))
+        .body(Body::from(
+            r#"{"email":"bob@example.com","role":"viewer","permission":"read"}"#,
+        ))
+        .unwrap();
+    app.request(req).await;
+
+    // Bob lists his invites
+    let req = Request::builder()
+        .uri("/api/invites")
+        .header("authorization", format!("Bearer {bob_token}"))
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.request(req).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp).await;
+    let invites = json.as_array().unwrap();
+    assert_eq!(invites.len(), 1);
+    assert_eq!(invites[0]["vault_id"], vault_id);
+}
+
+#[tokio::test]
+async fn api_accept_invite_sets_status() {
+    let app = TestApp::new();
+    let (_, owner_token) = api_register_and_login(&app, "alice@example.com", "Secret123!").await;
+    let (_, bob_token) = api_register_and_login(&app, "bob@example.com", "Secret123!").await;
+    let vault_id = api_create_vault(&app, &owner_token, "Family").await;
+
+    // Send invite
+    let req = Request::builder()
+        .method("POST")
+        .uri(format!("/api/vaults/{vault_id}/invites"))
+        .header("content-type", "application/json")
+        .header("authorization", format!("Bearer {owner_token}"))
+        .body(Body::from(
+            r#"{"email":"bob@example.com","role":"viewer","permission":"read"}"#,
+        ))
+        .unwrap();
+    let resp = app.request(req).await;
+    let json = body_json(resp).await;
+    let invite_id = json["invite_id"].as_str().unwrap();
+
+    // Accept
+    let req = Request::builder()
+        .method("POST")
+        .uri(format!("/api/invites/{invite_id}/accept"))
+        .header("content-type", "application/json")
+        .header("authorization", format!("Bearer {bob_token}"))
+        .body(Body::from(
+            serde_json::json!({
+                "public_key": "cc".repeat(32),
+                "confirmation_key": "dd".repeat(32),
+            })
+            .to_string(),
+        ))
+        .unwrap();
+    let resp = app.request(req).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn api_get_accepted_invites_owner_only() {
+    let app = TestApp::new();
+    let (_, owner_token) = api_register_and_login(&app, "alice@example.com", "Secret123!").await;
+    let (_, bob_token) = api_register_and_login(&app, "bob@example.com", "Secret123!").await;
+    let vault_id = api_create_vault(&app, &owner_token, "Family").await;
+
+    // Non-owner → 403
+    let req = Request::builder()
+        .uri(format!("/api/vaults/{vault_id}/invites/accepted"))
+        .header("authorization", format!("Bearer {bob_token}"))
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.request(req).await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+    // Owner → 200
+    let req = Request::builder()
+        .uri(format!("/api/vaults/{vault_id}/invites/accepted"))
+        .header("authorization", format!("Bearer {owner_token}"))
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.request(req).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn api_complete_invite_adds_member() {
+    let app = TestApp::new();
+    let (_, owner_token) = api_register_and_login(&app, "alice@example.com", "Secret123!").await;
+    let (_, bob_token) = api_register_and_login(&app, "bob@example.com", "Secret123!").await;
+    let vault_id = api_create_vault(&app, &owner_token, "Family").await;
+
+    api_full_invite(&app, &owner_token, &vault_id, "bob@example.com", &bob_token).await;
+
+    // Verify member was added
+    let req = Request::builder()
+        .uri(format!("/api/vaults/{vault_id}/members"))
+        .header("authorization", format!("Bearer {owner_token}"))
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.request(req).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp).await;
+    let members = json.as_array().unwrap();
+    assert_eq!(members.len(), 2); // owner + bob
+}
+
+#[tokio::test]
+async fn api_full_invite_flow() {
+    let app = TestApp::new();
+    let (owner_id, owner_token) =
+        api_register_and_login(&app, "alice@example.com", "Secret123!").await;
+    let (bob_id, bob_token) = api_register_and_login(&app, "bob@example.com", "Secret123!").await;
+    let vault_id = api_create_vault(&app, &owner_token, "Family").await;
+
+    // Full flow
+    api_full_invite(&app, &owner_token, &vault_id, "bob@example.com", &bob_token).await;
+
+    // List vaults — owner sees member_count = 2
+    let req = Request::builder()
+        .uri("/api/vaults")
+        .header("authorization", format!("Bearer {owner_token}"))
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.request(req).await;
+    let json = body_json(resp).await;
+    assert_eq!(json[0]["member_count"], 2);
+
+    // List members — both users present
+    let req = Request::builder()
+        .uri(format!("/api/vaults/{vault_id}/members"))
+        .header("authorization", format!("Bearer {owner_token}"))
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.request(req).await;
+    let json = body_json(resp).await;
+    let members = json.as_array().unwrap();
+    let member_ids: Vec<&str> = members
+        .iter()
+        .map(|m| m["user_id"].as_str().unwrap())
+        .collect();
+    assert!(member_ids.contains(&owner_id.as_str()));
+    assert!(member_ids.contains(&bob_id.as_str()));
+}
+
+#[tokio::test]
+async fn api_accept_wrong_invite_returns_404() {
+    let app = TestApp::new();
+    let (_, token) = api_register_and_login(&app, "alice@example.com", "Secret123!").await;
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/invites/nonexistent-id/accept")
+        .header("content-type", "application/json")
+        .header("authorization", format!("Bearer {token}"))
+        .body(Body::from(
+            serde_json::json!({
+                "public_key": "cc".repeat(32),
+                "confirmation_key": "dd".repeat(32),
+            })
+            .to_string(),
+        ))
+        .unwrap();
+    let resp = app.request(req).await;
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+// ════════════════════════════════════════════
+// Members
+// ════════════════════════════════════════════
+
+#[tokio::test]
+async fn api_list_members_returns_details() {
+    let app = TestApp::new();
+    let (_, token) = api_register_and_login(&app, "alice@example.com", "Secret123!").await;
+    let vault_id = api_create_vault(&app, &token, "Family").await;
+
+    let req = Request::builder()
+        .uri(format!("/api/vaults/{vault_id}/members"))
+        .header("authorization", format!("Bearer {token}"))
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.request(req).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp).await;
+    let members = json.as_array().unwrap();
+    assert_eq!(members.len(), 1);
+    assert!(members[0]["user_id"].as_str().is_some());
+    assert!(members[0]["permission"].as_str().is_some());
+    assert!(members[0]["crypto_status"].as_str().is_some());
+}
+
+#[tokio::test]
+async fn api_revoke_member_removes() {
+    let app = TestApp::new();
+    let (_, owner_token) = api_register_and_login(&app, "alice@example.com", "Secret123!").await;
+    let (bob_id, bob_token) = api_register_and_login(&app, "bob@example.com", "Secret123!").await;
+    let vault_id = api_create_vault(&app, &owner_token, "Family").await;
+
+    api_full_invite(&app, &owner_token, &vault_id, "bob@example.com", &bob_token).await;
+
+    // Revoke bob
+    let req = Request::builder()
+        .method("DELETE")
+        .uri(format!("/api/vaults/{vault_id}/members/{bob_id}"))
+        .header("authorization", format!("Bearer {owner_token}"))
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.request(req).await;
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+    // Verify members list is 1 (owner only)
+    let req = Request::builder()
+        .uri(format!("/api/vaults/{vault_id}/members"))
+        .header("authorization", format!("Bearer {owner_token}"))
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.request(req).await;
+    let json = body_json(resp).await;
+    assert_eq!(json.as_array().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn api_revoke_owner_forbidden() {
+    let app = TestApp::new();
+    let (owner_id, owner_token) =
+        api_register_and_login(&app, "alice@example.com", "Secret123!").await;
+    let vault_id = api_create_vault(&app, &owner_token, "Family").await;
+
+    let req = Request::builder()
+        .method("DELETE")
+        .uri(format!("/api/vaults/{vault_id}/members/{owner_id}"))
+        .header("authorization", format!("Bearer {owner_token}"))
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.request(req).await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+}
+
+// ════════════════════════════════════════════
+// Entries (zero-knowledge)
+// ════════════════════════════════════════════
+
+#[tokio::test]
+async fn api_push_entries_creates() {
+    let app = TestApp::new();
+    let (_, token) = api_register_and_login(&app, "alice@example.com", "Secret123!").await;
+    let vault_id = api_create_vault(&app, &token, "Family").await;
+
+    let req = Request::builder()
+        .method("POST")
+        .uri(format!("/api/vaults/{vault_id}/entries"))
+        .header("content-type", "application/json")
+        .header("authorization", format!("Bearer {token}"))
+        .body(Body::from(
+            serde_json::json!({
+                "entries": [{
+                    "id": "entry-1",
+                    "category": "login",
+                    "encrypted_data": "deadbeef",
+                    "nonce": "aabbccdd",
+                    "last_modified": "2024-01-01T00:00:00Z",
+                }]
+            })
+            .to_string(),
+        ))
+        .unwrap();
+    let resp = app.request(req).await;
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+}
+
+#[tokio::test]
+async fn api_pull_entries_returns_pushed() {
+    let app = TestApp::new();
+    let (_, token) = api_register_and_login(&app, "alice@example.com", "Secret123!").await;
+    let vault_id = api_create_vault(&app, &token, "Family").await;
+
+    // Push
+    let req = Request::builder()
+        .method("POST")
+        .uri(format!("/api/vaults/{vault_id}/entries"))
+        .header("content-type", "application/json")
+        .header("authorization", format!("Bearer {token}"))
+        .body(Body::from(
+            serde_json::json!({
+                "entries": [{
+                    "id": "entry-1",
+                    "category": "login",
+                    "encrypted_data": "deadbeef",
+                    "nonce": "aabbccdd",
+                    "last_modified": "2024-01-01T00:00:00Z",
+                }]
+            })
+            .to_string(),
+        ))
+        .unwrap();
+    app.request(req).await;
+
+    // Pull
+    let req = Request::builder()
+        .uri(format!("/api/vaults/{vault_id}/entries"))
+        .header("authorization", format!("Bearer {token}"))
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.request(req).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp).await;
+    let entries = json.as_array().unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0]["id"], "entry-1");
+    assert_eq!(entries[0]["encrypted_data"], "deadbeef");
+}
+
+#[tokio::test]
+async fn api_push_entries_upsert() {
+    let app = TestApp::new();
+    let (_, token) = api_register_and_login(&app, "alice@example.com", "Secret123!").await;
+    let vault_id = api_create_vault(&app, &token, "Family").await;
+
+    let push_entry = |data: &str| {
+        serde_json::json!({
+            "entries": [{
+                "id": "entry-1",
+                "category": "login",
+                "encrypted_data": data,
+                "nonce": "aabbccdd",
+                "last_modified": "2024-01-01T00:00:00Z",
+            }]
+        })
+        .to_string()
+    };
+
+    // Push v1
+    let req = Request::builder()
+        .method("POST")
+        .uri(format!("/api/vaults/{vault_id}/entries"))
+        .header("content-type", "application/json")
+        .header("authorization", format!("Bearer {token}"))
+        .body(Body::from(push_entry("version1")))
+        .unwrap();
+    app.request(req).await;
+
+    // Push v2 (same id, different data)
+    let req = Request::builder()
+        .method("POST")
+        .uri(format!("/api/vaults/{vault_id}/entries"))
+        .header("content-type", "application/json")
+        .header("authorization", format!("Bearer {token}"))
+        .body(Body::from(push_entry("version2")))
+        .unwrap();
+    app.request(req).await;
+
+    // Pull — should have 1 entry, not 2
+    let req = Request::builder()
+        .uri(format!("/api/vaults/{vault_id}/entries"))
+        .header("authorization", format!("Bearer {token}"))
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.request(req).await;
+    let json = body_json(resp).await;
+    let entries = json.as_array().unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0]["encrypted_data"], "version2");
+}
+
+#[tokio::test]
+async fn api_pull_entries_delta_sync() {
+    let app = TestApp::new();
+    let (_, token) = api_register_and_login(&app, "alice@example.com", "Secret123!").await;
+    let vault_id = api_create_vault(&app, &token, "Family").await;
+
+    // Push old entry
+    let req = Request::builder()
+        .method("POST")
+        .uri(format!("/api/vaults/{vault_id}/entries"))
+        .header("content-type", "application/json")
+        .header("authorization", format!("Bearer {token}"))
+        .body(Body::from(
+            serde_json::json!({
+                "entries": [{
+                    "id": "old-entry",
+                    "category": "login",
+                    "encrypted_data": "old-data",
+                    "nonce": "aabbccdd",
+                    "last_modified": "2020-01-01T00:00:00Z",
+                }]
+            })
+            .to_string(),
+        ))
+        .unwrap();
+    app.request(req).await;
+
+    // Push new entry
+    let req = Request::builder()
+        .method("POST")
+        .uri(format!("/api/vaults/{vault_id}/entries"))
+        .header("content-type", "application/json")
+        .header("authorization", format!("Bearer {token}"))
+        .body(Body::from(
+            serde_json::json!({
+                "entries": [{
+                    "id": "new-entry",
+                    "category": "login",
+                    "encrypted_data": "new-data",
+                    "nonce": "eeff0011",
+                    "last_modified": "2025-06-01T00:00:00Z",
+                }]
+            })
+            .to_string(),
+        ))
+        .unwrap();
+    app.request(req).await;
+
+    // Pull with since=2024 — should only return new-entry
+    let req = Request::builder()
+        .uri(format!(
+            "/api/vaults/{vault_id}/entries?since=2024-01-01T00:00:00Z"
+        ))
+        .header("authorization", format!("Bearer {token}"))
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.request(req).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp).await;
+    let entries = json.as_array().unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0]["id"], "new-entry");
+}
+
+#[tokio::test]
+async fn api_entries_non_member_forbidden() {
+    let app = TestApp::new();
+    let (_, owner_token) = api_register_and_login(&app, "alice@example.com", "Secret123!").await;
+    let (_, other_token) = api_register_and_login(&app, "bob@example.com", "Secret123!").await;
+    let vault_id = api_create_vault(&app, &owner_token, "Family").await;
+
+    // Non-member push → 403
+    let req = Request::builder()
+        .method("POST")
+        .uri(format!("/api/vaults/{vault_id}/entries"))
+        .header("content-type", "application/json")
+        .header("authorization", format!("Bearer {other_token}"))
+        .body(Body::from(
+            serde_json::json!({
+                "entries": [{
+                    "id": "entry-1",
+                    "category": "login",
+                    "encrypted_data": "data",
+                    "nonce": "nonce",
+                    "last_modified": "2024-01-01T00:00:00Z",
+                }]
+            })
+            .to_string(),
+        ))
+        .unwrap();
+    let resp = app.request(req).await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+    // Non-member pull → 403
+    let req = Request::builder()
+        .uri(format!("/api/vaults/{vault_id}/entries"))
+        .header("authorization", format!("Bearer {other_token}"))
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.request(req).await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+}
+
+// ════════════════════════════════════════════
+// Re-keying
+// ════════════════════════════════════════════
+
+#[tokio::test]
+async fn api_update_keys_owner_only() {
+    let app = TestApp::new();
+    let (owner_id, owner_token) =
+        api_register_and_login(&app, "alice@example.com", "Secret123!").await;
+    let (_, other_token) = api_register_and_login(&app, "bob@example.com", "Secret123!").await;
+    let vault_id = api_create_vault(&app, &owner_token, "Family").await;
+
+    let body = serde_json::json!({
+        "members": [{
+            "user_id": owner_id,
+            "encrypted_vault_key": "newkey123",
+            "nonce": "newnonce",
+        }]
+    })
+    .to_string();
+
+    // Non-owner → 403
+    let req = Request::builder()
+        .method("PUT")
+        .uri(format!("/api/vaults/{vault_id}/keys"))
+        .header("content-type", "application/json")
+        .header("authorization", format!("Bearer {other_token}"))
+        .body(Body::from(body.clone()))
+        .unwrap();
+    let resp = app.request(req).await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+    // Owner → 204
+    let req = Request::builder()
+        .method("PUT")
+        .uri(format!("/api/vaults/{vault_id}/keys"))
+        .header("content-type", "application/json")
+        .header("authorization", format!("Bearer {owner_token}"))
+        .body(Body::from(body))
+        .unwrap();
+    let resp = app.request(req).await;
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+}
+
+#[tokio::test]
+async fn api_rekey_after_revoke_flow() {
+    let app = TestApp::new();
+    let (owner_id, owner_token) =
+        api_register_and_login(&app, "alice@example.com", "Secret123!").await;
+    let (bob_id, bob_token) = api_register_and_login(&app, "bob@example.com", "Secret123!").await;
+    let vault_id = api_create_vault(&app, &owner_token, "Family").await;
+
+    // Invite bob
+    api_full_invite(&app, &owner_token, &vault_id, "bob@example.com", &bob_token).await;
+
+    // Push entry
+    let req = Request::builder()
+        .method("POST")
+        .uri(format!("/api/vaults/{vault_id}/entries"))
+        .header("content-type", "application/json")
+        .header("authorization", format!("Bearer {owner_token}"))
+        .body(Body::from(
+            serde_json::json!({
+                "entries": [{
+                    "id": "entry-1",
+                    "category": "login",
+                    "encrypted_data": "secret-data",
+                    "nonce": "aabbccdd",
+                    "last_modified": "2024-01-01T00:00:00Z",
+                }]
+            })
+            .to_string(),
+        ))
+        .unwrap();
+    app.request(req).await;
+
+    // Revoke bob
+    let req = Request::builder()
+        .method("DELETE")
+        .uri(format!("/api/vaults/{vault_id}/members/{bob_id}"))
+        .header("authorization", format!("Bearer {owner_token}"))
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.request(req).await;
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+    // Re-key: update vault keys for owner
+    let req = Request::builder()
+        .method("PUT")
+        .uri(format!("/api/vaults/{vault_id}/keys"))
+        .header("content-type", "application/json")
+        .header("authorization", format!("Bearer {owner_token}"))
+        .body(Body::from(
+            serde_json::json!({
+                "members": [{
+                    "user_id": owner_id,
+                    "encrypted_vault_key": "re-keyed-vault-key",
+                    "nonce": "new-nonce-hex",
+                }]
+            })
+            .to_string(),
+        ))
+        .unwrap();
+    let resp = app.request(req).await;
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+    // Entries still accessible for owner
+    let req = Request::builder()
+        .uri(format!("/api/vaults/{vault_id}/entries"))
+        .header("authorization", format!("Bearer {owner_token}"))
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.request(req).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp).await;
+    assert_eq!(json.as_array().unwrap().len(), 1);
 }

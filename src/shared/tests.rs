@@ -1,10 +1,8 @@
 use super::*;
 use crate::crypto_operations::FakeCrypto;
 use crate::types::{
-    EncryptionKey, EntryId, EntryPassword, Login, PlainEntry, ServiceName, ServiceUrl,
-    SharedVaultName, UserId, VaultPass, VaultPermission,
+    EncryptionKey, Role, SharedVaultId, SharedVaultName, UserId, VaultPass, VaultPermission,
 };
-use chrono::Utc;
 
 fn open_test_shared_db() -> SharedDB<FakeCrypto> {
     SharedDB::open(":memory:", FakeCrypto).unwrap()
@@ -18,18 +16,43 @@ fn make_pass(user_id: &str, email: &str, ek: &str) -> VaultPass {
     )
 }
 
-fn make_plain_entry(entry_id: &str, user_id: &str) -> PlainEntry {
-    PlainEntry {
-        id: EntryId::new(entry_id.to_string()),
-        user_id: UserId::new(user_id.to_string()),
-        service_name: ServiceName::new("Netflix".to_string()),
-        service_url: ServiceUrl::new("https://netflix.com".to_string()),
-        login: Login::new("family@example.com".to_string()),
-        password: EntryPassword::new("netflix-pass-123".to_string()),
-        notes: "family account".to_string(),
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
-    }
+/// Helper: create vault + complete full invite flow for a member.
+/// Returns the vault id.
+fn setup_vault_with_member(
+    db: &SharedDB<FakeCrypto>,
+    owner: &VaultPass,
+    member_id: &UserId,
+    member_email: &str,
+    permission: VaultPermission,
+) -> SharedVaultId {
+    let vault = db
+        .create_shared_vault(owner, SharedVaultName::new("V".to_string()))
+        .unwrap();
+
+    // Full 4-step invite flow
+    let (invite_id, _code) = db
+        .create_invite(
+            owner.user_id(),
+            &vault.id,
+            member_email,
+            Role::Editor,
+            permission,
+        )
+        .unwrap();
+
+    db.accept_invite(&invite_id, member_id, "pub_key_hex", "confirm_key_hex")
+        .unwrap();
+
+    db.complete_invite(
+        &invite_id,
+        owner.user_id(),
+        "encrypted_vault_key_hex",
+        "nonce_hex",
+        "owner_pub_key_hex",
+    )
+    .unwrap();
+
+    vault.id
 }
 
 // ── Keypair ──
@@ -55,7 +78,6 @@ fn decrypt_user_private_key_roundtrip() {
     let ek = EncryptionKey::new("test_key_xyz".to_string());
 
     db.save_user_keypair(&uid, &ek).unwrap();
-    // Should not panic — decryption succeeds
     let _priv_key = db.decrypt_user_private_key(&uid, &ek).unwrap();
 }
 
@@ -90,39 +112,38 @@ fn list_shared_vaults_returns_owned_and_member() {
     db.save_user_keypair(pass_b.user_id(), pass_b.encryption_key())
         .unwrap();
 
-    let vault = db
-        .create_shared_vault(&pass_a, SharedVaultName::new("Shared".to_string()))
-        .unwrap();
-    db.invite_member(&pass_a, &vault.id, pass_b.user_id(), VaultPermission::Read)
-        .unwrap();
+    let vault_id = setup_vault_with_member(
+        &db,
+        &pass_a,
+        pass_b.user_id(),
+        "b@test.com",
+        VaultPermission::Read,
+    );
 
     let a_vaults = db.list_shared_vaults(pass_a.user_id()).unwrap();
     let b_vaults = db.list_shared_vaults(pass_b.user_id()).unwrap();
 
     assert_eq!(a_vaults.len(), 1);
     assert_eq!(b_vaults.len(), 1);
-    assert_eq!(a_vaults[0].id.as_str(), b_vaults[0].id.as_str());
+    assert_eq!(a_vaults[0].id.as_str(), vault_id.as_str());
+    assert_eq!(b_vaults[0].id.as_str(), vault_id.as_str());
 }
 
-// ── Invite ──
+// ── 4-step Invite flow ──
 
 #[test]
-fn invite_member_appears_in_list() {
+fn full_invite_flow_adds_member() {
     let db = open_test_shared_db();
     let pass_a = make_pass("user-a", "a@test.com", "ek_a");
-    let pass_b = make_pass("user-b", "b@test.com", "ek_b");
     db.save_user_keypair(pass_a.user_id(), pass_a.encryption_key())
         .unwrap();
-    db.save_user_keypair(pass_b.user_id(), pass_b.encryption_key())
-        .unwrap();
 
-    let vault = db
-        .create_shared_vault(&pass_a, SharedVaultName::new("V".to_string()))
-        .unwrap();
-    db.invite_member(&pass_a, &vault.id, pass_b.user_id(), VaultPermission::Read)
-        .unwrap();
+    let uid_b = UserId::new("user-b".to_string());
 
-    let members = db.list_members(pass_a.user_id(), &vault.id).unwrap();
+    let vault_id =
+        setup_vault_with_member(&db, &pass_a, &uid_b, "b@test.com", VaultPermission::Read);
+
+    let members = db.list_members(pass_a.user_id(), &vault_id).unwrap();
     assert_eq!(members.len(), 2);
 }
 
@@ -131,27 +152,27 @@ fn invite_requires_ownership() {
     let db = open_test_shared_db();
     let pass_a = make_pass("user-a", "a@test.com", "ek_a");
     let pass_b = make_pass("user-b", "b@test.com", "ek_b");
-    let pass_c = make_pass("user-c", "c@test.com", "ek_c");
     db.save_user_keypair(pass_a.user_id(), pass_a.encryption_key())
         .unwrap();
     db.save_user_keypair(pass_b.user_id(), pass_b.encryption_key())
         .unwrap();
-    db.save_user_keypair(pass_c.user_id(), pass_c.encryption_key())
-        .unwrap();
 
-    let vault = db
-        .create_shared_vault(&pass_a, SharedVaultName::new("V".to_string()))
-        .unwrap();
-    db.invite_member(
+    let vault_id = setup_vault_with_member(
+        &db,
         &pass_a,
-        &vault.id,
         pass_b.user_id(),
+        "b@test.com",
         VaultPermission::ReadWrite,
-    )
-    .unwrap();
+    );
 
-    // B is a member but not owner — cannot invite
-    let result = db.invite_member(&pass_b, &vault.id, pass_c.user_id(), VaultPermission::Read);
+    // B is a member but not owner — cannot create invite
+    let result = db.create_invite(
+        pass_b.user_id(),
+        &vault_id,
+        "c@test.com",
+        Role::Viewer,
+        VaultPermission::Read,
+    );
     assert!(matches!(result, Err(SharedError::Forbidden(_))));
 }
 
@@ -169,33 +190,37 @@ fn invite_limit_5_members() {
     // Owner is member #1, invite 4 more (total 5)
     for i in 1..=4 {
         let uid = format!("user-{i}");
-        let pass = make_pass(&uid, &format!("{uid}@test.com"), &format!("ek_{uid}"));
-        db.save_user_keypair(pass.user_id(), pass.encryption_key())
+        let email = format!("{uid}@test.com");
+        let (invite_id, _) = db
+            .create_invite(
+                owner_pass.user_id(),
+                &vault.id,
+                &email,
+                Role::Viewer,
+                VaultPermission::Read,
+            )
             .unwrap();
-        db.invite_member(
-            &owner_pass,
-            &vault.id,
-            pass.user_id(),
-            VaultPermission::Read,
-        )
-        .unwrap();
+
+        let member_uid = UserId::new(uid);
+        db.accept_invite(&invite_id, &member_uid, "pk", "ck")
+            .unwrap();
+        db.complete_invite(&invite_id, owner_pass.user_id(), "evk", "n", "opk")
+            .unwrap();
     }
 
     // 6th member should fail
-    let pass6 = make_pass("user-5", "user5@test.com", "ek_user5");
-    db.save_user_keypair(pass6.user_id(), pass6.encryption_key())
-        .unwrap();
-    let result = db.invite_member(
-        &owner_pass,
+    let result = db.create_invite(
+        owner_pass.user_id(),
         &vault.id,
-        pass6.user_id(),
+        "user5@test.com",
+        Role::Viewer,
         VaultPermission::Read,
     );
     assert!(matches!(result, Err(SharedError::MemberLimit(_))));
 }
 
 #[test]
-fn invite_requires_keypair() {
+fn accept_invite_sets_status_accepted() {
     let db = open_test_shared_db();
     let pass_a = make_pass("user-a", "a@test.com", "ek_a");
     db.save_user_keypair(pass_a.user_id(), pass_a.encryption_key())
@@ -205,10 +230,54 @@ fn invite_requires_keypair() {
         .create_shared_vault(&pass_a, SharedVaultName::new("V".to_string()))
         .unwrap();
 
-    // user-b has no keypair
+    let (invite_id, _code) = db
+        .create_invite(
+            pass_a.user_id(),
+            &vault.id,
+            "b@test.com",
+            Role::Editor,
+            VaultPermission::ReadWrite,
+        )
+        .unwrap();
+
     let uid_b = UserId::new("user-b".to_string());
-    let result = db.invite_member(&pass_a, &vault.id, &uid_b, VaultPermission::Read);
-    assert!(matches!(result, Err(SharedError::NoKeypair(_))));
+    db.accept_invite(&invite_id, &uid_b, "pub_key", "conf_key")
+        .unwrap();
+
+    // Owner can see accepted invites
+    let accepted = db
+        .get_accepted_invites(&vault.id, pass_a.user_id())
+        .unwrap();
+    assert_eq!(accepted.len(), 1);
+    assert_eq!(accepted[0].user_id.as_str(), "user-b");
+    assert_eq!(accepted[0].public_key_hex, "pub_key");
+}
+
+#[test]
+fn list_user_invites_returns_invites_by_email() {
+    let db = open_test_shared_db();
+    let pass_a = make_pass("user-a", "a@test.com", "ek_a");
+    db.save_user_keypair(pass_a.user_id(), pass_a.encryption_key())
+        .unwrap();
+
+    let vault = db
+        .create_shared_vault(&pass_a, SharedVaultName::new("V".to_string()))
+        .unwrap();
+
+    let (_invite_id, _code) = db
+        .create_invite(
+            pass_a.user_id(),
+            &vault.id,
+            "b@test.com",
+            Role::Viewer,
+            VaultPermission::Read,
+        )
+        .unwrap();
+
+    let uid_b = UserId::new("user-b".to_string());
+    let invites = db.list_user_invites(&uid_b, "b@test.com").unwrap();
+    assert_eq!(invites.len(), 1);
+    assert_eq!(invites[0].vault_id.as_str(), vault.id.as_str());
 }
 
 // ── Revoke ──
@@ -223,16 +292,18 @@ fn revoke_member_removes_from_members() {
     db.save_user_keypair(pass_b.user_id(), pass_b.encryption_key())
         .unwrap();
 
-    let vault = db
-        .create_shared_vault(&pass_a, SharedVaultName::new("V".to_string()))
-        .unwrap();
-    db.invite_member(&pass_a, &vault.id, pass_b.user_id(), VaultPermission::Read)
-        .unwrap();
+    let vault_id = setup_vault_with_member(
+        &db,
+        &pass_a,
+        pass_b.user_id(),
+        "b@test.com",
+        VaultPermission::Read,
+    );
 
-    assert_eq!(db.member_count(&vault.id).unwrap(), 2);
-    db.revoke_member(&pass_a, &vault.id, pass_b.user_id())
+    assert_eq!(db.member_count(&vault_id).unwrap(), 2);
+    db.revoke_member(&pass_a, &vault_id, pass_b.user_id())
         .unwrap();
-    assert_eq!(db.member_count(&vault.id).unwrap(), 1);
+    assert_eq!(db.member_count(&vault_id).unwrap(), 1);
 }
 
 #[test]
@@ -262,21 +333,23 @@ fn update_permission_read_to_readwrite() {
     db.save_user_keypair(pass_b.user_id(), pass_b.encryption_key())
         .unwrap();
 
-    let vault = db
-        .create_shared_vault(&pass_a, SharedVaultName::new("V".to_string()))
-        .unwrap();
-    db.invite_member(&pass_a, &vault.id, pass_b.user_id(), VaultPermission::Read)
-        .unwrap();
+    let vault_id = setup_vault_with_member(
+        &db,
+        &pass_a,
+        pass_b.user_id(),
+        "b@test.com",
+        VaultPermission::Read,
+    );
 
     db.update_member_permission(
         &pass_a,
-        &vault.id,
+        &vault_id,
         pass_b.user_id(),
         VaultPermission::ReadWrite,
     )
     .unwrap();
 
-    let members = db.list_members(pass_a.user_id(), &vault.id).unwrap();
+    let members = db.list_members(pass_a.user_id(), &vault_id).unwrap();
     let b_member = members
         .iter()
         .find(|m| m.user_id.as_str() == "user-b")
@@ -284,10 +357,10 @@ fn update_permission_read_to_readwrite() {
     assert_eq!(b_member.permission, VaultPermission::ReadWrite);
 }
 
-// ── Shared entries ──
+// ── Shared entries (zero-knowledge) ──
 
 #[test]
-fn add_and_view_shared_entry_roundtrip() {
+fn add_and_list_shared_entries() {
     let db = open_test_shared_db();
     let pass = make_pass("owner", "owner@test.com", "ek_owner");
     db.save_user_keypair(pass.user_id(), pass.encryption_key())
@@ -297,91 +370,70 @@ fn add_and_view_shared_entry_roundtrip() {
         .create_shared_vault(&pass, SharedVaultName::new("V".to_string()))
         .unwrap();
 
-    let plain = make_plain_entry("entry-1", "owner");
-    let entry_id = db.add_shared_entry(&pass, &vault.id, &plain).unwrap();
+    let entry_id = db
+        .add_shared_entry(
+            pass.user_id(),
+            &vault.id,
+            "entry-1",
+            "encrypted_blob_hex",
+            "nonce_hex",
+            "passwords",
+        )
+        .unwrap();
 
-    let viewed = db.view_shared_entry(&pass, &vault.id, &entry_id).unwrap();
-
-    assert_eq!(viewed.service_name.as_str(), "Netflix");
-    assert_eq!(viewed.password.as_str(), "netflix-pass-123");
-    assert_eq!(viewed.notes, "family account");
+    let entries = db
+        .list_shared_entries(pass.user_id(), &vault.id, None)
+        .unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].id.as_str(), entry_id.as_str());
+    assert_eq!(entries[0].encrypted_data.as_str(), "encrypted_blob_hex");
+    assert_eq!(entries[0].category, "passwords");
+    assert!(!entries[0].deleted);
 }
 
 #[test]
 fn readonly_member_cannot_add_entry() {
     let db = open_test_shared_db();
     let pass_a = make_pass("user-a", "a@test.com", "ek_a");
-    let pass_b = make_pass("user-b", "b@test.com", "ek_b");
+    let uid_b = UserId::new("user-b".to_string());
     db.save_user_keypair(pass_a.user_id(), pass_a.encryption_key())
         .unwrap();
-    db.save_user_keypair(pass_b.user_id(), pass_b.encryption_key())
-        .unwrap();
 
-    let vault = db
-        .create_shared_vault(&pass_a, SharedVaultName::new("V".to_string()))
-        .unwrap();
-    db.invite_member(&pass_a, &vault.id, pass_b.user_id(), VaultPermission::Read)
-        .unwrap();
+    let vault_id =
+        setup_vault_with_member(&db, &pass_a, &uid_b, "b@test.com", VaultPermission::Read);
 
-    let plain = make_plain_entry("entry-1", "user-b");
-    let result = db.add_shared_entry(&pass_b, &vault.id, &plain);
+    let result = db.add_shared_entry(&uid_b, &vault_id, "entry-1", "enc", "nonce", "cat");
     assert!(matches!(result, Err(SharedError::Forbidden(_))));
 }
 
 #[test]
-fn different_members_decrypt_same_entry() {
+fn non_member_cannot_list_entries() {
     let db = open_test_shared_db();
     let pass_a = make_pass("user-a", "a@test.com", "ek_a");
-    let pass_b = make_pass("user-b", "b@test.com", "ek_b");
+    let uid_c = UserId::new("user-c".to_string());
     db.save_user_keypair(pass_a.user_id(), pass_a.encryption_key())
-        .unwrap();
-    db.save_user_keypair(pass_b.user_id(), pass_b.encryption_key())
         .unwrap();
 
     let vault = db
         .create_shared_vault(&pass_a, SharedVaultName::new("V".to_string()))
         .unwrap();
-    db.invite_member(
-        &pass_a,
+
+    db.add_shared_entry(
+        pass_a.user_id(),
         &vault.id,
-        pass_b.user_id(),
-        VaultPermission::ReadWrite,
+        "entry-1",
+        "enc",
+        "nonce",
+        "cat",
     )
     .unwrap();
 
-    // A adds entry
-    let plain = make_plain_entry("entry-1", "user-a");
-    let entry_id = db.add_shared_entry(&pass_a, &vault.id, &plain).unwrap();
-
-    // B views the same entry
-    let viewed_by_b = db.view_shared_entry(&pass_b, &vault.id, &entry_id).unwrap();
-    assert_eq!(viewed_by_b.service_name.as_str(), "Netflix");
-    assert_eq!(viewed_by_b.password.as_str(), "netflix-pass-123");
-}
-
-#[test]
-fn non_member_cannot_view_entries() {
-    let db = open_test_shared_db();
-    let pass_a = make_pass("user-a", "a@test.com", "ek_a");
-    let pass_c = make_pass("user-c", "c@test.com", "ek_c");
-    db.save_user_keypair(pass_a.user_id(), pass_a.encryption_key())
-        .unwrap();
-    db.save_user_keypair(pass_c.user_id(), pass_c.encryption_key())
-        .unwrap();
-
-    let vault = db
-        .create_shared_vault(&pass_a, SharedVaultName::new("V".to_string()))
-        .unwrap();
-
-    let plain = make_plain_entry("entry-1", "user-a");
-    db.add_shared_entry(&pass_a, &vault.id, &plain).unwrap();
-
-    let result = db.list_shared_entries(&pass_c, &vault.id);
+    let result = db.list_shared_entries(&uid_c, &vault.id, None);
     assert!(matches!(result, Err(SharedError::Forbidden(_))));
 }
 
 #[test]
-fn delete_shared_entry() {
+fn soft_delete_shared_entry() {
     let db = open_test_shared_db();
     let pass = make_pass("owner", "owner@test.com", "ek_owner");
     db.save_user_keypair(pass.user_id(), pass.encryption_key())
@@ -391,90 +443,161 @@ fn delete_shared_entry() {
         .create_shared_vault(&pass, SharedVaultName::new("V".to_string()))
         .unwrap();
 
-    let plain = make_plain_entry("entry-1", "owner");
-    let entry_id = db.add_shared_entry(&pass, &vault.id, &plain).unwrap();
+    let entry_id = db
+        .add_shared_entry(pass.user_id(), &vault.id, "entry-1", "enc", "nonce", "cat")
+        .unwrap();
 
-    let deleted = db.delete_shared_entry(&pass, &vault.id, &entry_id).unwrap();
+    let deleted = db
+        .delete_shared_entry(pass.user_id(), &vault.id, &entry_id)
+        .unwrap();
     assert!(deleted);
 
-    let result = db.view_shared_entry(&pass, &vault.id, &entry_id);
-    assert!(matches!(result, Err(SharedError::NotFound(_))));
+    // Without since, soft-deleted entries are NOT returned
+    let entries = db
+        .list_shared_entries(pass.user_id(), &vault.id, None)
+        .unwrap();
+    assert!(entries.is_empty());
 }
 
-// ── Revocation re-keying ──
-
 #[test]
-fn remaining_members_decrypt_after_rekey() {
+fn delta_sync_returns_tombstones() {
     let db = open_test_shared_db();
-    let pass_a = make_pass("user-a", "a@test.com", "ek_a");
-    let pass_b = make_pass("user-b", "b@test.com", "ek_b");
-    let pass_c = make_pass("user-c", "c@test.com", "ek_c");
-    db.save_user_keypair(pass_a.user_id(), pass_a.encryption_key())
-        .unwrap();
-    db.save_user_keypair(pass_b.user_id(), pass_b.encryption_key())
-        .unwrap();
-    db.save_user_keypair(pass_c.user_id(), pass_c.encryption_key())
+    let pass = make_pass("owner", "owner@test.com", "ek_owner");
+    db.save_user_keypair(pass.user_id(), pass.encryption_key())
         .unwrap();
 
     let vault = db
-        .create_shared_vault(&pass_a, SharedVaultName::new("V".to_string()))
-        .unwrap();
-    db.invite_member(
-        &pass_a,
-        &vault.id,
-        pass_b.user_id(),
-        VaultPermission::ReadWrite,
-    )
-    .unwrap();
-    db.invite_member(&pass_a, &vault.id, pass_c.user_id(), VaultPermission::Read)
+        .create_shared_vault(&pass, SharedVaultName::new("V".to_string()))
         .unwrap();
 
-    // Add entry before revocation
-    let plain = make_plain_entry("entry-1", "user-a");
-    db.add_shared_entry(&pass_a, &vault.id, &plain).unwrap();
-
-    // Revoke B → re-key
-    db.revoke_member(&pass_a, &vault.id, pass_b.user_id())
+    // Add entry at time T0
+    let before_add = chrono::Utc::now() - chrono::Duration::seconds(1);
+    let entry_id = db
+        .add_shared_entry(pass.user_id(), &vault.id, "entry-1", "enc", "nonce", "cat")
         .unwrap();
 
-    // A (owner) can still decrypt
-    let viewed_a = db
-        .view_shared_entry(&pass_a, &vault.id, &EntryId::new("entry-1".to_string()))
+    // Delete entry
+    db.delete_shared_entry(pass.user_id(), &vault.id, &entry_id)
         .unwrap();
-    assert_eq!(viewed_a.service_name.as_str(), "Netflix");
 
-    // C (remaining member) can still decrypt
-    let viewed_c = db
-        .view_shared_entry(&pass_c, &vault.id, &EntryId::new("entry-1".to_string()))
+    // Delta sync with `since` before the entry was created should show the tombstone
+    let entries = db
+        .list_shared_entries(pass.user_id(), &vault.id, Some(before_add))
         .unwrap();
-    assert_eq!(viewed_c.service_name.as_str(), "Netflix");
+    assert_eq!(entries.len(), 1);
+    assert!(entries[0].deleted);
 }
+
+#[test]
+fn push_entries_upsert() {
+    let db = open_test_shared_db();
+    let pass = make_pass("owner", "owner@test.com", "ek_owner");
+    db.save_user_keypair(pass.user_id(), pass.encryption_key())
+        .unwrap();
+
+    let vault = db
+        .create_shared_vault(&pass, SharedVaultName::new("V".to_string()))
+        .unwrap();
+
+    let now = chrono::Utc::now().to_rfc3339();
+    let entries = vec![(
+        "entry-1".to_string(),
+        "enc_v1".to_string(),
+        "nonce_v1".to_string(),
+        "passwords".to_string(),
+        now.clone(),
+        false,
+    )];
+
+    let count = db
+        .push_entries(pass.user_id(), &vault.id, &entries)
+        .unwrap();
+    assert_eq!(count, 1);
+
+    // Push again with updated data — should upsert, not duplicate
+    let entries_v2 = vec![(
+        "entry-1".to_string(),
+        "enc_v2".to_string(),
+        "nonce_v2".to_string(),
+        "passwords".to_string(),
+        now,
+        false,
+    )];
+    let count2 = db
+        .push_entries(pass.user_id(), &vault.id, &entries_v2)
+        .unwrap();
+    assert_eq!(count2, 1);
+
+    let all = db
+        .list_shared_entries(pass.user_id(), &vault.id, None)
+        .unwrap();
+    assert_eq!(all.len(), 1);
+    assert_eq!(all[0].encrypted_data.as_str(), "enc_v2");
+}
+
+// ── Update member keys (re-keying) ──
+
+#[test]
+fn update_member_keys_owner_only() {
+    let db = open_test_shared_db();
+    let pass_a = make_pass("user-a", "a@test.com", "ek_a");
+    let uid_b = UserId::new("user-b".to_string());
+    db.save_user_keypair(pass_a.user_id(), pass_a.encryption_key())
+        .unwrap();
+
+    let vault_id = setup_vault_with_member(
+        &db,
+        &pass_a,
+        &uid_b,
+        "b@test.com",
+        VaultPermission::ReadWrite,
+    );
+
+    let keys = vec![
+        (
+            "user-a".to_string(),
+            "new_evk_a".to_string(),
+            "new_nonce_a".to_string(),
+        ),
+        (
+            "user-b".to_string(),
+            "new_evk_b".to_string(),
+            "new_nonce_b".to_string(),
+        ),
+    ];
+
+    db.update_member_keys(pass_a.user_id(), &vault_id, &keys)
+        .unwrap();
+}
+
+// ── Revocation + re-key ──
 
 #[test]
 fn revoked_member_cannot_access_vault() {
     let db = open_test_shared_db();
     let pass_a = make_pass("user-a", "a@test.com", "ek_a");
-    let pass_b = make_pass("user-b", "b@test.com", "ek_b");
+    let uid_b = UserId::new("user-b".to_string());
     db.save_user_keypair(pass_a.user_id(), pass_a.encryption_key())
         .unwrap();
-    db.save_user_keypair(pass_b.user_id(), pass_b.encryption_key())
-        .unwrap();
 
-    let vault = db
-        .create_shared_vault(&pass_a, SharedVaultName::new("V".to_string()))
-        .unwrap();
-    db.invite_member(&pass_a, &vault.id, pass_b.user_id(), VaultPermission::Read)
-        .unwrap();
+    let vault_id =
+        setup_vault_with_member(&db, &pass_a, &uid_b, "b@test.com", VaultPermission::Read);
 
-    let plain = make_plain_entry("entry-1", "user-a");
-    db.add_shared_entry(&pass_a, &vault.id, &plain).unwrap();
+    db.add_shared_entry(
+        pass_a.user_id(),
+        &vault_id,
+        "entry-1",
+        "enc",
+        "nonce",
+        "cat",
+    )
+    .unwrap();
 
     // Revoke B
-    db.revoke_member(&pass_a, &vault.id, pass_b.user_id())
-        .unwrap();
+    db.revoke_member(&pass_a, &vault_id, &uid_b).unwrap();
 
     // B cannot list entries anymore
-    let result = db.list_shared_entries(&pass_b, &vault.id);
+    let result = db.list_shared_entries(&uid_b, &vault_id, None);
     assert!(matches!(result, Err(SharedError::Forbidden(_))));
 }
 
@@ -491,8 +614,8 @@ fn delete_shared_vault_removes_all() {
         .create_shared_vault(&pass, SharedVaultName::new("V".to_string()))
         .unwrap();
 
-    let plain = make_plain_entry("entry-1", "owner");
-    db.add_shared_entry(&pass, &vault.id, &plain).unwrap();
+    db.add_shared_entry(pass.user_id(), &vault.id, "entry-1", "enc", "nonce", "cat")
+        .unwrap();
 
     db.delete_shared_vault(&pass, &vault.id).unwrap();
 
@@ -500,35 +623,24 @@ fn delete_shared_vault_removes_all() {
     assert!(vaults.is_empty());
 }
 
-// ── Cryptographic isolation (AC#3) ──
+// ── List vaults with counts ──
 
 #[test]
-fn compromised_member_cannot_access_other_personal_vaults() {
-    // User A and B share a vault.
-    // Knowing A's EncryptionKey does NOT let you decrypt B's private key.
+fn list_shared_vaults_with_counts() {
     let db = open_test_shared_db();
-    let pass_a = make_pass("user-a", "a@test.com", "ek_a");
-    let pass_b = make_pass("user-b", "b@test.com", "ek_b");
-    db.save_user_keypair(pass_a.user_id(), pass_a.encryption_key())
-        .unwrap();
-    db.save_user_keypair(pass_b.user_id(), pass_b.encryption_key())
+    let pass = make_pass("owner", "owner@test.com", "ek_owner");
+    db.save_user_keypair(pass.user_id(), pass.encryption_key())
         .unwrap();
 
-    // A tries to decrypt B's private key using A's EncryptionKey
-    let result = db.decrypt_user_private_key(pass_b.user_id(), pass_a.encryption_key());
-    // With FakeCrypto this won't fail because FakeCrypto is just hex encode/decode,
-    // but the point is that with RealCrypto, decrypting B's private key
-    // with A's EncryptionKey would return garbage (wrong AES key → decryption failure).
-    // The FakeCrypto test validates the isolation at the data model level:
-    // different user_ids have different encrypted_private_keys.
-    // The RealCrypto test in crypto_operations::tests verifies the crypto correctness.
-    let _ = result; // FakeCrypto won't error, but the architecture ensures isolation
+    let vault = db
+        .create_shared_vault(&pass, SharedVaultName::new("V".to_string()))
+        .unwrap();
 
-    // What we CAN verify: A and B have different public keys
-    let pk_a = db.get_user_public_key(pass_a.user_id()).unwrap();
-    let pk_b = db.get_user_public_key(pass_b.user_id()).unwrap();
-    // With FakeCrypto, both get the same deterministic key, but with RealCrypto
-    // they would be different. The real isolation test is test_x25519_key_wrapping_roundtrip
-    // in crypto_operations::tests which proves wrong keys fail decryption.
-    let _ = (pk_a, pk_b);
+    db.add_shared_entry(pass.user_id(), &vault.id, "entry-1", "enc", "nonce", "cat")
+        .unwrap();
+
+    let vaults = db.list_shared_vaults_with_counts(pass.user_id()).unwrap();
+    assert_eq!(vaults.len(), 1);
+    assert_eq!(vaults[0].member_count, 1);
+    assert_eq!(vaults[0].entry_count, 1);
 }

@@ -1,82 +1,15 @@
-use crate::crypto_operations::{CryptoError, CryptoProvider};
-use crate::types::{
-    EncryptedData, EncryptionKey, EntryId, Nonce, SharedVaultId, SharedVaultMember, UserId,
-    VaultPass, VaultPermission,
-};
+use crate::crypto_operations::CryptoProvider;
+use crate::types::{SharedVaultId, SharedVaultMember, UserId, VaultPass, VaultPermission};
 use chrono::{DateTime, Utc};
 use rusqlite::params;
 
+use super::SharedDB;
 use super::error::SharedError;
-use super::{MAX_MEMBERS, SharedDB};
 
 impl<C: CryptoProvider> SharedDB<C> {
-    /// Invite a user to a shared vault (owner only).
-    pub fn invite_member(
-        &self,
-        pass: &VaultPass,
-        vault_id: &SharedVaultId,
-        target_user_id: &UserId,
-        permission: VaultPermission,
-    ) -> Result<(), SharedError> {
-        self.verify_ownership(pass.user_id(), vault_id)?;
-
-        // Check member limit
-        let count = self.member_count(vault_id)?;
-        if count >= MAX_MEMBERS {
-            return Err(SharedError::MemberLimit(format!(
-                "shared vault already has {count} members (max {MAX_MEMBERS})"
-            )));
-        }
-
-        // Check target has keypair
-        if !self.has_user_keypair(target_user_id)? {
-            return Err(SharedError::NoKeypair(format!(
-                "user {} has no keypair",
-                target_user_id.as_str()
-            )));
-        }
-
-        // Decrypt SharedVaultKey
-        let vault_key = self.decrypt_shared_vault_key(vault_id, pass)?;
-        let vault_key_bytes = hex::decode(vault_key.as_str())
-            .map_err(|e| SharedError::Crypto(CryptoError::InvalidKey(e.to_string())))?;
-
-        // Get target's public key
-        let target_public = self.get_user_public_key(target_user_id)?;
-
-        // Generate ephemeral keypair for target
-        let (ephemeral_pub, ephemeral_priv) = self.crypto.generate_x25519_keypair();
-
-        // DH(ephemeral_private, target_public) → AES key
-        let shared_aes = self
-            .crypto
-            .x25519_derive_shared_key(&ephemeral_priv, target_public.as_str())?;
-
-        // Encrypt vault key for target
-        let (encrypted_vault_key, vault_key_nonce) =
-            self.crypto.encrypt_raw(&vault_key_bytes, &shared_aes)?;
-
-        // Insert member
-        self.conn
-            .execute(
-                "INSERT INTO shared_vault_members (vault_id, user_id, encrypted_vault_key, vault_key_nonce, ephemeral_public_key, permission, invited_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                params![
-                    vault_id.as_str(),
-                    target_user_id.as_str(),
-                    &encrypted_vault_key,
-                    &vault_key_nonce,
-                    &ephemeral_pub,
-                    permission.as_str(),
-                    Utc::now().to_rfc3339(),
-                ],
-            )
-            .map_err(|e| SharedError::Database(format!("Failed to invite member: {e}")))?;
-
-        Ok(())
-    }
-
-    /// Revoke a member (owner only). Triggers re-keying.
+    /// Revoke a member (owner only).
+    /// In zero-knowledge model: just delete the member row.
+    /// Client is responsible for re-keying via update_member_keys().
     pub fn revoke_member(
         &self,
         pass: &VaultPass,
@@ -101,49 +34,12 @@ impl<C: CryptoProvider> SharedDB<C> {
             )));
         }
 
-        // Decrypt OLD SharedVaultKey
-        let old_vault_key = self.decrypt_shared_vault_key(vault_id, pass)?;
-        let old_ek = EncryptionKey::new(old_vault_key.as_str().to_string());
-
-        // Generate NEW SharedVaultKey
-        let new_key_bytes: [u8; 32] = rand::random();
-        let new_key_hex = hex::encode(new_key_bytes);
-        let new_ek = EncryptionKey::new(new_key_hex.clone());
-
-        // BEGIN TRANSACTION
+        // Transaction: delete member + mark related invites as rejected
         self.conn
             .execute_batch("BEGIN")
             .map_err(|e| SharedError::Database(e.to_string()))?;
 
         let result = (|| -> Result<(), SharedError> {
-            // Re-encrypt all entries
-            let entries = self.list_shared_entries_raw(vault_id)?;
-            for entry in &entries {
-                let ee = crate::types::EncryptedEntry {
-                    id: EntryId::new(entry.id.as_str().to_string()),
-                    user_id: UserId::new(entry.created_by.as_str().to_string()),
-                    encrypted_data: EncryptedData::new(entry.encrypted_data.as_str().to_string()),
-                    nonce: Nonce::new(entry.nonce.as_str().to_string()),
-                    created_at: entry.created_at,
-                    updated_at: entry.updated_at,
-                };
-                let plain = self.crypto.decrypt_entry(&ee, &old_ek)?;
-                let re_encrypted = self.crypto.encrypt_entry(&plain, &new_ek)?;
-
-                self.conn
-                    .execute(
-                        "UPDATE shared_entries SET encrypted_data = ?1, nonce = ?2, updated_at = ?3 WHERE id = ?4",
-                        params![
-                            re_encrypted.encrypted_data.as_str(),
-                            re_encrypted.nonce.as_str(),
-                            Utc::now().to_rfc3339(),
-                            entry.id.as_str(),
-                        ],
-                    )
-                    .map_err(|e| SharedError::Database(e.to_string()))?;
-            }
-
-            // Delete revoked member
             self.conn
                 .execute(
                     "DELETE FROM shared_vault_members WHERE vault_id = ?1 AND user_id = ?2",
@@ -151,30 +47,18 @@ impl<C: CryptoProvider> SharedDB<C> {
                 )
                 .map_err(|e| SharedError::Database(e.to_string()))?;
 
-            // Re-wrap key for remaining members
-            let remaining = self.list_member_user_ids(vault_id)?;
-            for member_uid in &remaining {
-                let member_public = self.get_user_public_key(member_uid)?;
-                let (eph_pub, eph_priv) = self.crypto.generate_x25519_keypair();
-                let shared_aes = self
-                    .crypto
-                    .x25519_derive_shared_key(&eph_priv, member_public.as_str())?;
-                let (enc_vault_key, vk_nonce) =
-                    self.crypto.encrypt_raw(&new_key_bytes, &shared_aes)?;
-
-                self.conn
-                    .execute(
-                        "UPDATE shared_vault_members SET encrypted_vault_key = ?1, vault_key_nonce = ?2, ephemeral_public_key = ?3 WHERE vault_id = ?4 AND user_id = ?5",
-                        params![
-                            &enc_vault_key,
-                            &vk_nonce,
-                            &eph_pub,
-                            vault_id.as_str(),
-                            member_uid.as_str(),
-                        ],
-                    )
-                    .map_err(|e| SharedError::Database(e.to_string()))?;
-            }
+            // Mark completed invites for this user as rejected
+            self.conn
+                .execute(
+                    "UPDATE invites SET status = 'rejected', updated_at = ?1
+                     WHERE vault_id = ?2 AND invitee_user_id = ?3 AND status = 'completed'",
+                    params![
+                        Utc::now().to_rfc3339(),
+                        vault_id.as_str(),
+                        target_user_id.as_str(),
+                    ],
+                )
+                .map_err(|e| SharedError::Database(e.to_string()))?;
 
             Ok(())
         })();
@@ -217,7 +101,119 @@ impl<C: CryptoProvider> SharedDB<C> {
         Ok(())
     }
 
+    /// Client-driven re-keying: bulk update encrypted vault keys for all members.
+    /// Owner only. Called after revoke to distribute new vault key.
+    pub fn update_member_keys(
+        &self,
+        owner_id: &UserId,
+        vault_id: &SharedVaultId,
+        member_keys: &[(String, String, String)], // (user_id, encrypted_vault_key, nonce)
+    ) -> Result<(), SharedError> {
+        self.verify_ownership(owner_id, vault_id)?;
+
+        self.conn
+            .execute_batch("BEGIN")
+            .map_err(|e| SharedError::Database(e.to_string()))?;
+
+        let result = (|| -> Result<(), SharedError> {
+            for (user_id, encrypted_key, nonce) in member_keys {
+                let updated = self
+                    .conn
+                    .execute(
+                        "UPDATE shared_vault_members SET encrypted_vault_key = ?1, vault_key_nonce = ?2
+                         WHERE vault_id = ?3 AND user_id = ?4",
+                        params![encrypted_key, nonce, vault_id.as_str(), user_id],
+                    )
+                    .map_err(|e| SharedError::Database(e.to_string()))?;
+
+                if updated == 0 {
+                    return Err(SharedError::NotFound(format!(
+                        "member {user_id} not found in vault {}",
+                        vault_id.as_str()
+                    )));
+                }
+            }
+            Ok(())
+        })();
+
+        match result {
+            Ok(()) => {
+                self.conn
+                    .execute_batch("COMMIT")
+                    .map_err(|e| SharedError::Database(e.to_string()))?;
+                Ok(())
+            }
+            Err(e) => {
+                let _ = self.conn.execute_batch("ROLLBACK");
+                Err(e)
+            }
+        }
+    }
+
+    /// Get the encrypted vault key for a specific member.
+    /// Returns (encrypted_vault_key, nonce, sender_public_key).
+    pub fn get_member_encrypted_key(
+        &self,
+        user_id: &UserId,
+        vault_id: &SharedVaultId,
+    ) -> Result<(String, String, String), SharedError> {
+        // Verify caller is a member
+        if !self.is_member(vault_id, user_id)? {
+            return Err(SharedError::Forbidden("not a member".to_string()));
+        }
+
+        let row = self
+            .conn
+            .query_row(
+                "SELECT encrypted_vault_key, vault_key_nonce, ephemeral_public_key
+                 FROM shared_vault_members WHERE vault_id = ?1 AND user_id = ?2",
+                params![vault_id.as_str(), user_id.as_str()],
+                |row| {
+                    let key: String = row.get(0)?;
+                    let nonce: String = row.get(1)?;
+                    let sender_pk: String = row.get(2)?;
+                    Ok((key, nonce, sender_pk))
+                },
+            )
+            .map_err(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => {
+                    SharedError::NotFound("member key not found".to_string())
+                }
+                _ => SharedError::Database(e.to_string()),
+            })?;
+
+        if row.0.is_empty() {
+            return Err(SharedError::NotFound(
+                "vault key not yet available".to_string(),
+            ));
+        }
+
+        Ok(row)
+    }
+
+    /// Get the owner's user_id for a vault.
+    #[allow(dead_code)]
+    pub fn get_vault_owner_id(&self, vault_id: &SharedVaultId) -> Result<UserId, SharedError> {
+        let owner: String = self
+            .conn
+            .query_row(
+                "SELECT owner_id FROM shared_vaults WHERE id = ?1",
+                params![vault_id.as_str()],
+                |row| row.get(0),
+            )
+            .map_err(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => {
+                    SharedError::NotFound("vault not found".to_string())
+                }
+                _ => SharedError::Database(e.to_string()),
+            })?;
+
+        Ok(UserId::new(owner))
+    }
+
     /// List members of a shared vault (any member can see).
+    /// Returns expanded data including email (from vault.db lookup done at handler level),
+    /// public_key, and role.
     pub fn list_members(
         &self,
         user_id: &UserId,

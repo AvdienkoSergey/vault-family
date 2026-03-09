@@ -11,7 +11,26 @@ use pbkdf2::{
 };
 use sha2::Sha256;
 use std::fmt;
+use std::sync::LazyLock;
 use types::{EncryptedEntry, EncryptionKey, PlainEntry};
+
+/// PBKDF2 iteration count, configurable via `PBKDF2_ITERATIONS` env var.
+/// Default: 600 000 (release) / 100 000 (debug).
+static PBKDF2_ITERATIONS: LazyLock<u32> = LazyLock::new(|| {
+    if let Ok(val) = std::env::var("PBKDF2_ITERATIONS")
+        && let Ok(n) = val.parse::<u32>()
+    {
+        tracing::info!(iterations = n, "PBKDF2 iterations (from env)");
+        return n;
+    }
+    let default = if cfg!(debug_assertions) {
+        100_000
+    } else {
+        600_000
+    };
+    tracing::info!(iterations = default, "PBKDF2 iterations (default)");
+    default
+});
 
 #[cfg(test)]
 mod fake;
@@ -190,9 +209,14 @@ impl CryptoProvider for RealCrypto {
         &self,
         password: &MasterPassword,
     ) -> Result<(MasterPasswordHash, AuthSalt), CryptoError> {
+        let rounds = *PBKDF2_ITERATIONS;
         let salt = SaltString::generate(&mut OsRng);
+        let params = pbkdf2::Params {
+            rounds,
+            output_length: 32,
+        };
         let password_hash = Pbkdf2
-            .hash_password(password.as_str().as_bytes(), &salt)
+            .hash_password_customized(password.as_str().as_bytes(), None, None, params, &salt)
             .map_err(|e| CryptoError::HashingFailed(e.to_string()))?
             .to_string();
         Ok((
@@ -222,7 +246,7 @@ impl CryptoProvider for RealCrypto {
         password: &MasterPassword,
         salt: &EncryptionSalt,
     ) -> EncryptionKey {
-        let iterations = 600_000;
+        let iterations = *PBKDF2_ITERATIONS;
         let mut bytes = [0u8; 32];
         pbkdf2::pbkdf2_hmac::<Sha256>(
             password.as_str().as_bytes(),
