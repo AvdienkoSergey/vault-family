@@ -295,6 +295,7 @@ pub struct PushEntriesRequest {
 }
 
 #[derive(Deserialize)]
+#[cfg_attr(feature = "swagger", derive(utoipa::ToSchema))]
 pub struct PullEntriesQuery {
     pub since: Option<String>,
 }

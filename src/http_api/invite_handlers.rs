@@ -25,6 +25,19 @@ fn shared_error_to_status(err: &SharedError) -> StatusCode {
 }
 
 /// POST /api/vaults/{vault_id}/invites
+#[cfg_attr(feature = "swagger", utoipa::path(
+    post,
+    path = "/api/vaults/{vault_id}/invites",
+    tag = "Invites",
+    security(("bearer_jwt" = [])),
+    params(("vault_id" = String, Path, description = "Shared vault ID")),
+    request_body = SendInviteRequest,
+    responses(
+        (status = 200, description = "Invite sent", body = SendInviteResponse),
+        (status = 401, description = "Not authenticated"),
+        (status = 403, description = "Not vault owner"),
+    )
+))]
 pub async fn send_invite_handler<C: CryptoProvider + Clone + Send + Sync + 'static>(
     State(state): State<AppState<C>>,
     headers: axum::http::HeaderMap,
@@ -66,6 +79,16 @@ pub async fn send_invite_handler<C: CryptoProvider + Clone + Send + Sync + 'stat
 }
 
 /// GET /api/invites
+#[cfg_attr(feature = "swagger", utoipa::path(
+    get,
+    path = "/api/invites",
+    tag = "Invites",
+    security(("bearer_jwt" = [])),
+    responses(
+        (status = 200, description = "Pending invites for current user", body = Vec<ApiInviteItem>),
+        (status = 401, description = "Not authenticated"),
+    )
+))]
 pub async fn list_my_invites_handler<C: CryptoProvider + Clone + Send + Sync + 'static>(
     State(state): State<AppState<C>>,
     headers: axum::http::HeaderMap,
@@ -107,6 +130,20 @@ pub async fn list_my_invites_handler<C: CryptoProvider + Clone + Send + Sync + '
 }
 
 /// POST /api/invites/{invite_id}/accept
+#[cfg_attr(feature = "swagger", utoipa::path(
+    post,
+    path = "/api/invites/{invite_id}/accept",
+    tag = "Invites",
+    security(("bearer_jwt" = [])),
+    params(("invite_id" = String, Path, description = "Invite ID")),
+    request_body = AcceptInviteRequest,
+    responses(
+        (status = 200, description = "Invite accepted"),
+        (status = 401, description = "Not authenticated"),
+        (status = 404, description = "Invite not found"),
+        (status = 409, description = "Invalid invite state"),
+    )
+))]
 pub async fn accept_invite_handler<C: CryptoProvider + Clone + Send + Sync + 'static>(
     State(state): State<AppState<C>>,
     headers: axum::http::HeaderMap,
@@ -140,6 +177,18 @@ pub async fn accept_invite_handler<C: CryptoProvider + Clone + Send + Sync + 'st
 }
 
 /// GET /api/vaults/{vault_id}/invites/accepted
+#[cfg_attr(feature = "swagger", utoipa::path(
+    get,
+    path = "/api/vaults/{vault_id}/invites/accepted",
+    tag = "Invites",
+    security(("bearer_jwt" = [])),
+    params(("vault_id" = String, Path, description = "Shared vault ID")),
+    responses(
+        (status = 200, description = "Accepted invites awaiting key distribution", body = Vec<ApiAcceptedInviteItem>),
+        (status = 401, description = "Not authenticated"),
+        (status = 403, description = "Not vault owner"),
+    )
+))]
 pub async fn get_accepted_invites_handler<C: CryptoProvider + Clone + Send + Sync + 'static>(
     State(state): State<AppState<C>>,
     headers: axum::http::HeaderMap,
@@ -178,6 +227,20 @@ pub async fn get_accepted_invites_handler<C: CryptoProvider + Clone + Send + Syn
 }
 
 /// POST /api/invites/{invite_id}/complete
+#[cfg_attr(feature = "swagger", utoipa::path(
+    post,
+    path = "/api/invites/{invite_id}/complete",
+    tag = "Invites",
+    security(("bearer_jwt" = [])),
+    params(("invite_id" = String, Path, description = "Invite ID")),
+    request_body = CompleteInviteRequest,
+    responses(
+        (status = 204, description = "Invite completed, member added"),
+        (status = 401, description = "Not authenticated"),
+        (status = 404, description = "Invite not found"),
+        (status = 409, description = "Invalid invite state"),
+    )
+))]
 pub async fn complete_invite_handler<C: CryptoProvider + Clone + Send + Sync + 'static>(
     State(state): State<AppState<C>>,
     headers: axum::http::HeaderMap,
