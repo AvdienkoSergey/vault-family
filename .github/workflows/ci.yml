@@ -3,6 +3,10 @@ name: CI
 on:
   pull_request:
     branches: [main]
+  # Run on release-please branches so required checks pass on bot PRs
+  # (GITHUB_TOKEN events don't trigger pull_request, but push works)
+  push:
+    branches: ['release-please--**']
 
 env:
   CARGO_TERM_COLOR: always
