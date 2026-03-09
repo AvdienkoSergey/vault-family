@@ -161,6 +161,18 @@ pub struct ApiLoginResponse {
 }
 
 // ════════════════════════════════════════════════════════════════════
+// API — Change Password
+// ════════════════════════════════════════════════════════════════════
+
+#[derive(Deserialize)]
+#[cfg_attr(feature = "swagger", derive(utoipa::ToSchema))]
+pub struct ChangePasswordRequest {
+    pub email: String,
+    pub old_password: String,
+    pub new_password: String,
+}
+
+// ════════════════════════════════════════════════════════════════════
 // API — Shared Vaults (zero-knowledge)
 // ════════════════════════════════════════════════════════════════════
 

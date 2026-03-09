@@ -26,6 +26,7 @@ sha2 = "0.10.9"
 clap = {  version = "4.5.60", features = ["derive"] }
 rpassword = "7.4.0"
 dirs = "6.0.0"
+dotenvy = "0.15"
 email_address = "0.2.9"
 tokio = { version = "1.49.0", features = ["rt-multi-thread", "macros"] }
 axum = { version = "0.8.8", features = ["ws"] }

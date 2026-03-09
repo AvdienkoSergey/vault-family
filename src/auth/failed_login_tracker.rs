@@ -91,6 +91,18 @@ impl FailedLoginTracker {
         recent >= MAX_FAILED_ATTEMPTS as usize
     }
 
+    /// Сбросить счётчик при успешном логине.
+    ///
+    /// Легитимный пользователь с правильным паролем не должен быть
+    /// заблокирован из-за чужих неудачных попыток.
+    pub fn clear_attempts(&self, email: &str) {
+        let mut map = self
+            .inner
+            .write()
+            .expect("FailedLoginTracker lock poisoned");
+        map.remove(email);
+    }
+
     /// Удалить попытки старше окна наблюдения.
     fn cleanup_old(attempts: &mut Vec<DateTime<Utc>>) {
         let cutoff = Utc::now() - Duration::seconds(FAILED_ATTEMPTS_WINDOW_SECS);
@@ -150,6 +162,19 @@ mod tests {
 
         assert!(tracker.is_locked("alice@example.com"));
         assert!(!tracker.is_locked("bob@example.com"));
+    }
+
+    #[test]
+    fn clear_attempts_unlocks() {
+        let tracker = FailedLoginTracker::new();
+
+        for _ in 0..MAX_FAILED_ATTEMPTS {
+            tracker.record_failed_attempt("alice@example.com");
+        }
+        assert!(tracker.is_locked("alice@example.com"));
+
+        tracker.clear_attempts("alice@example.com");
+        assert!(!tracker.is_locked("alice@example.com"));
     }
 
     #[test]
